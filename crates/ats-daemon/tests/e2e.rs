@@ -702,6 +702,16 @@ async fn orchestrator_is_singleton_no_tab_and_attachable() {
     }
     assert!(attached, "live orchestrator scrollback never showed agent output");
 
+    // the /setup-repo slash command was written into the orchestrator's cwd
+    let setup_cmd = tmp
+        .path()
+        .join("data")
+        .join("orchestrator")
+        .join(".claude")
+        .join("commands")
+        .join("setup-repo.md");
+    assert!(setup_cmd.exists(), "/setup-repo command was not written");
+
     let _ = client.request(Request::KillSession { session_id: s1.id }).await;
     server_handle.abort();
 }

@@ -100,19 +100,16 @@ async fn run(
     app.refresh().await?;
 
     // cold start: nothing registered and no orchestrator yet → open the
-    // orchestrator with an onboarding kickoff so first-run setup happens by
-    // conversation instead of `ats register`. (Skip on a second-monitor client.)
+    // orchestrator and run its `/setup-repo` command so first-run setup happens
+    // by conversation instead of `ats register`. (Skip on a second-monitor client.)
     if !app.solo && app.templates.is_empty() && !app.sessions.iter().any(|s| s.is_orchestrator) {
-        let kickoff = "No repos are registered with ATS yet. Greet the developer in one \
-            line, ask which local git repo they want you to manage, then register it as a \
-            template and spawn a session in it."
-            .to_string();
-        if let Ok(Response::Session { .. }) =
-            client.request(Request::EnsureOrchestrator { kickoff: Some(kickoff) }).await
+        if let Ok(Response::Session { .. }) = client
+            .request(Request::EnsureOrchestrator { kickoff: Some("/setup-repo".into()) })
+            .await
         {
             app.refresh().await?;
             app.modal = app::Modal::Orchestrator;
-            app.status_line = "orchestrator ready — type to it; it'll set up your first repo".into();
+            app.status_line = "orchestrator ready — running /setup-repo to onboard your first repo".into();
         }
     }
 

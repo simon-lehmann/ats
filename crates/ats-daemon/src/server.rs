@@ -45,6 +45,9 @@ sessions, send/broadcast instructions, read progress, harvest results, manage
 notes & prompts). If you do not see those tools, the MCP server isn't registered
 yet — tell the developer to run `ats mcp register` and restart you.
 
+**Quick setup:** run `/setup-repo <path>` to register a repo and start a session
+in it (it asks for the path if you omit it).
+
 ## How ATS work is organized
 - **Templates** are setup-complete local repos. `register_template {name, path}`
   blesses one; spawning a session clones a fresh workspace from it on its own
@@ -63,6 +66,28 @@ yet — tell the developer to run `ats mcp register` and restart you.
 - Destructive tools (kill/reset/destroy) need `confirm: true` and only when the
   developer explicitly asked. Never destroy your own session/workspace.
 - Be brief: what you did, and anything that needs the developer.
+"#;
+
+/// The `/setup-repo [path]` slash command, written into the orchestrator's
+/// `.claude/commands/`. Lets the developer onboard a repo with one command
+/// instead of a wall of kickoff text; the agent asks for the path if omitted.
+const ORCHESTRATOR_SETUP_REPO_CMD: &str = r#"---
+description: Set up a local git repo with ATS — register it and start a session
+argument-hint: [absolute-repo-path]
+---
+
+Set up a repository to work on with ATS.
+
+Target repository: $ARGUMENTS
+
+If no path is given above, ask the developer which local git repository they
+want to manage (an absolute path on this machine), and wait for their answer
+before continuing.
+
+Then, using the ATS tools (the `ats` MCP server):
+1. `register_template` — `name` = the repo's directory name, `path` = its absolute path.
+2. `spawn_session` from that template so an agent starts in a fresh workspace clone.
+3. Reply in one line: what you registered and that a session is starting.
 "#;
 
 impl Daemon {
@@ -244,6 +269,12 @@ impl Daemon {
             .with_context(|| format!("creating orchestrator dir {}", dir.display()))?;
         std::fs::write(dir.join("CLAUDE.md"), ORCHESTRATOR_CLAUDE_MD)
             .context("writing orchestrator CLAUDE.md")?;
+        // a `/setup-repo` slash command so onboarding is one clean command
+        let commands = dir.join(".claude").join("commands");
+        std::fs::create_dir_all(&commands)
+            .with_context(|| format!("creating {}", commands.display()))?;
+        std::fs::write(commands.join("setup-repo.md"), ORCHESTRATOR_SETUP_REPO_CMD)
+            .context("writing /setup-repo command")?;
 
         let resp = self
             .spawn_scratch_session(Some(dir.to_string_lossy().into_owned()), None, kickoff)

@@ -438,6 +438,20 @@ impl Store {
         Ok(())
     }
 
+    /// Reconcile the store at daemon startup: a fresh daemon owns no PTYs, so
+    /// every session still marked alive is an orphan from a previous daemon
+    /// instance (the daemon doesn't re-adopt old PTYs). Mark them dead and free
+    /// their tab slots so they don't appear as un-attachable ghost tabs.
+    /// Returns the number reaped.
+    pub fn reap_orphan_sessions(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE sessions SET state = 'dead', tab_slot = NULL WHERE state != 'dead'",
+            [],
+        )?;
+        Ok(n)
+    }
+
     /// The live orchestrator session, if one exists (newest non-dead).
     pub fn orchestrator_session(&self) -> Result<Option<SessionInfo>> {
         let conn = self.conn.lock().unwrap();
@@ -662,6 +676,23 @@ mod tests {
         let s2 = store.insert_session(ws, Some(3), None, None).unwrap();
         store.set_session_state(s2, SessionState::Dead, None).unwrap();
         assert_eq!(store.next_free_tab_slot(10).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn reap_orphans_kills_live_sessions_and_frees_tabs() {
+        let store = Store::open_in_memory().unwrap();
+        let t = store.insert_template("t", "/tmp", None, None, None).unwrap();
+        let ws = store.insert_workspace(t.id, "/tmp/ws", WorkspaceStatus::Ready).unwrap();
+        let s1 = store.insert_session(ws, Some(1), None, None).unwrap(); // 'working'
+        let s2 = store.insert_session(ws, Some(2), None, None).unwrap();
+        store.set_session_state(s2, SessionState::Dead, None).unwrap(); // already dead
+
+        // only the still-alive row is an orphan to reap
+        assert_eq!(store.reap_orphan_sessions().unwrap(), 1);
+        let s1 = store.get_session(s1).unwrap().unwrap();
+        assert_eq!(s1.state, SessionState::Dead);
+        assert!(s1.tab_slot.is_none());
+        assert_eq!(store.next_free_tab_slot(10).unwrap(), Some(1)); // slot freed
     }
 
     #[test]

@@ -46,6 +46,12 @@ async fn main() -> Result<()> {
     let config = load_config()?;
     let data_dir = ats_core::data_dir();
     let store = Arc::new(store::Store::open(&data_dir.join("ats.db"))?);
+    // a new daemon owns no PTYs: clear out sessions orphaned by a previous one
+    match store.reap_orphan_sessions() {
+        Ok(n) if n > 0 => tracing::info!(reaped = n, "reaped orphan sessions from a previous daemon"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("could not reap orphan sessions: {e:#}"),
+    }
     let socket = config
         .daemon
         .socket_path

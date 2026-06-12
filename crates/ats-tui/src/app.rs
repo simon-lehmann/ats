@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use ats_core::client::Client;
-use ats_core::rpc::{Request, Response, SessionInfo, TemplateInfo, WorkspaceInfo};
+use ats_core::rpc::{NoteInfo, PromptInfo, Request, Response, SessionInfo, TemplateInfo, WorkspaceInfo};
 use ats_core::state::SessionState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,14 +15,32 @@ pub enum Focus {
     GroupB,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Modal {
+    #[default]
     None,
     Help,
     /// template picker for Alt+s
     Spawn { selected: usize },
     /// review queue drain mode for Alt+q
     Queue { selected: usize },
+    /// notes panel for Alt+n
+    Notes { selected: usize },
+    /// minimal note editor; Tab switches title/body, Ctrl+s saves
+    NoteEdit {
+        id: Option<i64>,
+        title: String,
+        body: String,
+        editing_body: bool,
+    },
+    /// fuzzy prompt palette for Alt+p
+    Palette { query: String, selected: usize },
+    /// minimal prompt editor
+    PromptEdit {
+        label: String,
+        body: String,
+        editing_body: bool,
+    },
 }
 
 /// One attached terminal: a client-side vt100 screen fed from scrollback +
@@ -38,6 +56,8 @@ pub struct App {
     pub sessions: Vec<SessionInfo>,
     pub workspaces: Vec<WorkspaceInfo>,
     pub templates: Vec<TemplateInfo>,
+    pub notes: Vec<NoteInfo>,
+    pub prompts: Vec<PromptInfo>,
     pub focus: Focus,
     /// active slot per group (group A: 1..=a_slots, group B: a_slots+1..=a+b)
     pub active_a: u8,
@@ -59,6 +79,8 @@ impl App {
             sessions: Vec::new(),
             workspaces: Vec::new(),
             templates: Vec::new(),
+            notes: Vec::new(),
+            prompts: Vec::new(),
             focus: Focus::GroupA,
             active_a: 1,
             active_b: a_slots + 1,
@@ -116,7 +138,28 @@ impl App {
         {
             self.templates = templates;
         }
+        if let Response::Notes { notes } = self.client.request(Request::ListNotes).await? {
+            self.notes = notes;
+        }
+        if let Response::Prompts { prompts } = self.client.request(Request::ListPrompts).await? {
+            self.prompts = prompts;
+        }
         Ok(())
+    }
+
+    /// Prompts matching the palette query, best first (simple subsequence
+    /// scoring — frecency order from the daemon breaks ties).
+    pub fn filtered_prompts(&self, query: &str) -> Vec<&PromptInfo> {
+        if query.is_empty() {
+            return self.prompts.iter().collect();
+        }
+        let mut scored: Vec<(i64, &PromptInfo)> = self
+            .prompts
+            .iter()
+            .filter_map(|p| fuzzy_score(query, &p.label).map(|s| (s, p)))
+            .collect();
+        scored.sort_by_key(|(s, _)| -*s);
+        scored.into_iter().map(|(_, p)| p).collect()
     }
 
     /// Make sure the sessions visible in both groups are attached, and
@@ -193,5 +236,43 @@ pub fn state_glyph(state: SessionState) -> &'static str {
         SessionState::Finished => "●",
         SessionState::NeedsInput | SessionState::Error => "!",
         SessionState::Dead => "✕",
+    }
+}
+
+/// Tiny subsequence matcher: all query chars must appear in order;
+/// consecutive matches score higher. None = no match.
+pub fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
+    let text: Vec<char> = text.to_lowercase().chars().collect();
+    let mut score = 0i64;
+    let mut ti = 0usize;
+    let mut last_hit: Option<usize> = None;
+    for qc in query.to_lowercase().chars() {
+        if qc.is_whitespace() {
+            continue;
+        }
+        let pos = text[ti..].iter().position(|&c| c == qc)? + ti;
+        score += match last_hit {
+            Some(l) if pos == l + 1 => 3,
+            _ => 1,
+        };
+        last_hit = Some(pos);
+        ti = pos + 1;
+    }
+    Some(score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fuzzy_score;
+
+    #[test]
+    fn fuzzy_matches_subsequences_and_ranks_consecutive_higher() {
+        assert!(fuzzy_score("rvw", "review changes").is_some());
+        assert!(fuzzy_score("xyz", "review changes").is_none());
+        let consecutive = fuzzy_score("rev", "review").unwrap();
+        let scattered = fuzzy_score("rew", "review").unwrap();
+        assert!(consecutive > scattered);
+        // case-insensitive
+        assert!(fuzzy_score("RE", "review").is_some());
     }
 }

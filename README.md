@@ -59,14 +59,18 @@ the data dir with `$ATS_DATA_DIR`.
 | `Alt+r` | focus rail |
 | `Alt+s` | spawn: template → workspace → session |
 | `Alt+q` | review queue (Enter = jump) |
+| `Alt+n` | notes: n new, e edit, f finalize, Enter send to session |
+| `Alt+p` | prompt palette: type to filter, Enter paste |
 | `Alt+Esc` | raw mode (all keys to the PTY) |
 | `Alt+x` | detach UI — agents keep running |
 | `F1` | help |
 
 ## Status
 
-Phase 1 (MVP) complete: daemon-owned PTY sessions, template→workspace clones,
+Phases 1–2 complete: daemon-owned PTY sessions, template→workspace clones,
 two-group TUI with live vt100 rendering, attach/detach with scrollback,
-heartbeat status glyphs, headless CLI. Next: Phase 2 rail features
-(notes, prompt clipboard, transcript-based classification, harvest viewer) —
+transcript-based status (`!` needs input with the verbatim question, `●`
+finished with a summary line), notes (draft → finalize → send-to-session),
+prompt clipboard with fuzzy palette, git status in the rail, headless CLI.
+Next: Phase 3 orchestrator (LLM digests, cross-session questions) —
 see [docs/PLAN.md §5](docs/PLAN.md).

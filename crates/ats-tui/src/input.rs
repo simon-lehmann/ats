@@ -89,65 +89,8 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     }
 
     // modal handling first
-    match app.modal {
-        Modal::Help => {
-            if matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q')) {
-                app.modal = Modal::None;
-            }
-            return Ok(());
-        }
-        Modal::Spawn { selected } => {
-            match key.code {
-                KeyCode::Esc => app.modal = Modal::None,
-                KeyCode::Up => {
-                    app.modal = Modal::Spawn { selected: selected.saturating_sub(1) };
-                }
-                KeyCode::Down => {
-                    let max = app.templates.len().saturating_sub(1);
-                    app.modal = Modal::Spawn { selected: (selected + 1).min(max) };
-                }
-                KeyCode::Enter => {
-                    if let Some(t) = app.templates.get(selected) {
-                        let client = app.client.clone();
-                        let template_id = t.id;
-                        app.status_line = format!("spawning workspace from {}…", t.name);
-                        tokio::spawn(async move {
-                            let _ = client
-                                .request(Request::SpawnSession {
-                                    template_id,
-                                    tab_slot: None,
-                                    kickoff_note_id: None,
-                                })
-                                .await;
-                        });
-                    }
-                    app.modal = Modal::None;
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-        Modal::Queue { selected } => {
-            match key.code {
-                KeyCode::Esc => app.modal = Modal::None,
-                KeyCode::Up => app.modal = Modal::Queue { selected: selected.saturating_sub(1) },
-                KeyCode::Down => {
-                    let max = app.review_queue().len().saturating_sub(1);
-                    app.modal = Modal::Queue { selected: (selected + 1).min(max) };
-                }
-                KeyCode::Enter => {
-                    if let Some(s) = app.review_queue().get(selected) {
-                        if let Some(slot) = s.tab_slot {
-                            jump_to_slot(app, slot);
-                        }
-                    }
-                    app.modal = Modal::None;
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-        Modal::None => {}
+    if app.modal != Modal::None {
+        return handle_modal_key(app, key).await;
     }
 
     if key.code == KeyCode::F(1) {
@@ -180,6 +123,14 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.modal = Modal::Queue { selected: 0 };
                 return Ok(());
             }
+            KeyCode::Char('n') => {
+                app.modal = Modal::Notes { selected: 0 };
+                return Ok(());
+            }
+            KeyCode::Char('p') => {
+                app.modal = Modal::Palette { query: String::new(), selected: 0 };
+                return Ok(());
+            }
             KeyCode::Char('x') => {
                 app.should_quit = true;
                 return Ok(());
@@ -210,6 +161,210 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         Focus::GroupA | Focus::GroupB => forward(app, &key).await,
     }
+}
+
+/// Edit a string field from key input (the minimal editors).
+fn edit_text(s: &mut String, key: &KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => s.push(c),
+        KeyCode::Backspace => {
+            s.pop();
+        }
+        _ => {}
+    }
+}
+
+fn is_ctrl(key: &KeyEvent, c: char) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c)
+}
+
+async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let modal = std::mem::take(&mut app.modal);
+    match modal {
+        Modal::None => {}
+        Modal::Help => {
+            if !matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q')) {
+                app.modal = Modal::Help;
+            }
+        }
+        Modal::Spawn { selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => app.modal = Modal::Spawn { selected: selected.saturating_sub(1) },
+            KeyCode::Down => {
+                let max = app.templates.len().saturating_sub(1);
+                app.modal = Modal::Spawn { selected: (selected + 1).min(max) };
+            }
+            KeyCode::Enter => {
+                if let Some(t) = app.templates.get(selected) {
+                    let client = app.client.clone();
+                    let template_id = t.id;
+                    app.status_line = format!("spawning workspace from {}…", t.name);
+                    tokio::spawn(async move {
+                        let _ = client
+                            .request(Request::SpawnSession {
+                                template_id,
+                                tab_slot: None,
+                                kickoff_note_id: None,
+                            })
+                            .await;
+                    });
+                }
+            }
+            _ => app.modal = Modal::Spawn { selected },
+        },
+        Modal::Queue { selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => app.modal = Modal::Queue { selected: selected.saturating_sub(1) },
+            KeyCode::Down => {
+                let max = app.review_queue().len().saturating_sub(1);
+                app.modal = Modal::Queue { selected: (selected + 1).min(max) };
+            }
+            KeyCode::Enter => {
+                if let Some(s) = app.review_queue().get(selected) {
+                    if let Some(slot) = s.tab_slot {
+                        jump_to_slot(app, slot);
+                    }
+                }
+            }
+            _ => app.modal = Modal::Queue { selected },
+        },
+        Modal::Notes { selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => app.modal = Modal::Notes { selected: selected.saturating_sub(1) },
+            KeyCode::Down => {
+                let max = app.notes.len().saturating_sub(1);
+                app.modal = Modal::Notes { selected: (selected + 1).min(max) };
+            }
+            KeyCode::Char('n') => {
+                app.modal = Modal::NoteEdit {
+                    id: None,
+                    title: String::new(),
+                    body: String::new(),
+                    editing_body: false,
+                };
+            }
+            KeyCode::Char('e') => {
+                if let Some(n) = app.notes.get(selected) {
+                    app.modal = Modal::NoteEdit {
+                        id: Some(n.id),
+                        title: n.title.clone(),
+                        body: n.body.clone(),
+                        editing_body: true,
+                    };
+                } else {
+                    app.modal = Modal::Notes { selected };
+                }
+            }
+            KeyCode::Char('f') => {
+                if let Some(n) = app.notes.get(selected) {
+                    app.client.request(Request::FinalizeNote { id: n.id }).await?;
+                    app.refresh().await?;
+                }
+                app.modal = Modal::Notes { selected };
+            }
+            // Enter / 's': send note body to the active session
+            KeyCode::Enter | KeyCode::Char('s') => {
+                if let Some(n) = app.notes.get(selected) {
+                    if let Some(session_id) = app.active_session_id() {
+                        let note_id = n.id;
+                        app.client
+                            .request(Request::SendNoteToSession { note_id, session_id })
+                            .await?;
+                        app.status_line = format!("note {note_id} → session {session_id}");
+                        app.refresh().await?;
+                    } else {
+                        app.status_line = "no active session to send to".into();
+                        app.modal = Modal::Notes { selected };
+                    }
+                }
+            }
+            _ => app.modal = Modal::Notes { selected },
+        },
+        Modal::NoteEdit { id, mut title, mut body, editing_body } => {
+            if key.code == KeyCode::Esc {
+                app.modal = Modal::Notes { selected: 0 };
+            } else if is_ctrl(&key, 's') {
+                let resp = app
+                    .client
+                    .request(Request::UpsertNote { id, title, body })
+                    .await?;
+                if let ats_core::rpc::Response::Note { .. } = resp {
+                    app.refresh().await?;
+                }
+                app.modal = Modal::Notes { selected: 0 };
+            } else if key.code == KeyCode::Tab {
+                app.modal = Modal::NoteEdit { id, title, body, editing_body: !editing_body };
+            } else if key.code == KeyCode::Enter {
+                if editing_body {
+                    body.push('\n');
+                }
+                app.modal = Modal::NoteEdit { id, title, body, editing_body: true };
+            } else {
+                if editing_body {
+                    edit_text(&mut body, &key);
+                } else {
+                    edit_text(&mut title, &key);
+                }
+                app.modal = Modal::NoteEdit { id, title, body, editing_body };
+            }
+        }
+        Modal::Palette { mut query, selected } => {
+            if key.code == KeyCode::Esc {
+            } else if is_ctrl(&key, 'n') {
+                app.modal = Modal::PromptEdit {
+                    label: String::new(),
+                    body: String::new(),
+                    editing_body: false,
+                };
+            } else if key.code == KeyCode::Up {
+                app.modal = Modal::Palette { query, selected: selected.saturating_sub(1) };
+            } else if key.code == KeyCode::Down {
+                let max = app.filtered_prompts(&query).len().saturating_sub(1);
+                app.modal = Modal::Palette { query, selected: (selected + 1).min(max) };
+            } else if key.code == KeyCode::Enter {
+                let prompt_id = app.filtered_prompts(&query).get(selected).map(|p| p.id);
+                if let (Some(id), Some(session_id)) = (prompt_id, app.active_session_id()) {
+                    app.client.request(Request::UsePrompt { id, session_id }).await?;
+                    app.status_line = format!("prompt → session {session_id}");
+                    app.refresh().await?;
+                }
+            } else {
+                edit_text(&mut query, &key);
+                app.modal = Modal::Palette { query, selected: 0 };
+            }
+        }
+        Modal::PromptEdit { mut label, mut body, editing_body } => {
+            if key.code == KeyCode::Esc {
+                app.modal = Modal::Palette { query: String::new(), selected: 0 };
+            } else if is_ctrl(&key, 's') {
+                app.client
+                    .request(Request::UpsertPrompt {
+                        id: None,
+                        label,
+                        body,
+                        kind: "clipboard".into(),
+                    })
+                    .await?;
+                app.refresh().await?;
+                app.modal = Modal::Palette { query: String::new(), selected: 0 };
+            } else if key.code == KeyCode::Tab {
+                app.modal = Modal::PromptEdit { label, body, editing_body: !editing_body };
+            } else if key.code == KeyCode::Enter {
+                if editing_body {
+                    body.push('\n');
+                }
+                app.modal = Modal::PromptEdit { label, body, editing_body: true };
+            } else {
+                if editing_body {
+                    edit_text(&mut body, &key);
+                } else {
+                    edit_text(&mut label, &key);
+                }
+                app.modal = Modal::PromptEdit { label, body, editing_body };
+            }
+        }
+    }
+    Ok(())
 }
 
 fn jump_to_slot(app: &mut App, slot: u8) {

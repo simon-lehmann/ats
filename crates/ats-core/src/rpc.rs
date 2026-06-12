@@ -54,6 +54,12 @@ pub enum Request {
     FinalizeNote { id: i64 },
     SendNoteToSession { note_id: i64, session_id: i64 },
     ListPrompts,
+    UpsertPrompt {
+        id: Option<i64>,
+        label: String,
+        body: String,
+        kind: String,
+    },
     UsePrompt { id: i64, session_id: i64 },
     // orchestrator
     SummarizeSession { session_id: i64, force_llm: bool },
@@ -181,6 +187,13 @@ pub struct WorkspaceInfo {
     pub path: String,
     pub branch: Option<String>,
     pub status: WorkspaceStatus,
+    /// live `git status` figures; None when git info is unavailable
+    #[serde(default)]
+    pub dirty: Option<u32>,
+    #[serde(default)]
+    pub ahead: Option<u32>,
+    #[serde(default)]
+    pub behind: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

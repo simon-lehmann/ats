@@ -37,10 +37,18 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
     let a_inner = draw_group(frame, app, rows[0], Focus::GroupA);
     let b_inner = draw_group(frame, app, rows[1], Focus::GroupB);
 
-    match app.modal {
+    match &app.modal {
         Modal::Help => draw_help(frame),
-        Modal::Spawn { selected } => draw_spawn(frame, app, selected),
-        Modal::Queue { selected } => draw_queue(frame, app, selected),
+        Modal::Spawn { selected } => draw_spawn(frame, app, *selected),
+        Modal::Queue { selected } => draw_queue(frame, app, *selected),
+        Modal::Notes { selected } => draw_notes(frame, app, *selected),
+        Modal::NoteEdit { title, body, editing_body, .. } => {
+            draw_editor(frame, "note — Tab title/body, Ctrl+s save", title, body, *editing_body)
+        }
+        Modal::Palette { query, selected } => draw_palette(frame, app, query, *selected),
+        Modal::PromptEdit { label, body, editing_body } => {
+            draw_editor(frame, "prompt — Tab label/body, Ctrl+s save", label, body, *editing_body)
+        }
         Modal::None => {}
     }
 
@@ -67,9 +75,31 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| w.template_name.clone());
+        // git figures: "clean" / "~3" dirty, "+2/-1" ahead/behind
+        let git = match (w.dirty, w.ahead, w.behind) {
+            (Some(0), Some(0), Some(0)) | (Some(0), None, None) => "clean".to_string(),
+            (dirty, ahead, behind) => {
+                let mut parts = Vec::new();
+                if let Some(d) = dirty.filter(|d| *d > 0) {
+                    parts.push(format!("~{d}"));
+                }
+                if let Some(a) = ahead.filter(|a| *a > 0) {
+                    parts.push(format!("+{a}"));
+                }
+                if let Some(b) = behind.filter(|b| *b > 0) {
+                    parts.push(format!("-{b}"));
+                }
+                if parts.is_empty() { "clean".into() } else { parts.join(" ") }
+            }
+        };
+        let dirty_style = if git == "clean" { DIM } else { NORMAL };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {name:<18}"), NORMAL),
-            Span::styled(format!("{:?}", w.status).to_lowercase(), DIM),
+            Span::styled(format!("  {name:<14}"), NORMAL),
+            Span::styled(format!("{git:<8}"), dirty_style),
+            Span::styled(
+                w.branch.clone().unwrap_or_default(),
+                DIM,
+            ),
         ]));
     }
 
@@ -94,6 +124,27 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
         let mut text = format!("  {slot} {} {}", state_glyph(s.state), s.title);
         text.truncate(area.width.saturating_sub(2) as usize);
         lines.push(Line::styled(text, glyph_style(s.state)));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(format!("▾ PROMPTS ({})", app.prompts.len()), DIM));
+    for p in app.prompts.iter().take(3) {
+        let mut text = format!("  {}", p.label);
+        text.truncate(area.width.saturating_sub(2) as usize);
+        lines.push(Line::styled(text, DIM));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(format!("▾ NOTES ({})", app.notes.len()), DIM));
+    for n in app.notes.iter().take(4) {
+        let marker = match n.state.as_str() {
+            "finalized" => "▪",
+            "claimed" => "→",
+            _ => "·",
+        };
+        let mut text = format!("  {marker} {}", n.title);
+        text.truncate(area.width.saturating_sub(2) as usize);
+        lines.push(Line::styled(text, DIM));
     }
 
     let border_style = if app.focus == Focus::Rail { ACTIVE } else { DIM };
@@ -248,6 +299,8 @@ fn draw_help(frame: &mut Frame) {
         ("Alt+r", "focus rail"),
         ("Alt+s", "spawn: template → workspace → session"),
         ("Alt+q", "review queue (Enter jump, Esc close)"),
+        ("Alt+n", "notes: n new, e edit, f finalize, Enter send"),
+        ("Alt+p", "prompt palette (type to filter, Enter paste)"),
         ("Alt+Esc", "raw mode: forward all keys to the terminal"),
         ("Alt+x", "detach UI (daemon and agents keep running)"),
         ("F1 / Esc", "this help / close"),
@@ -282,6 +335,77 @@ fn draw_spawn(frame: &mut Frame, app: &App, selected: usize) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(modal_block("spawn session — Enter to confirm")),
+        area,
+    );
+}
+
+fn draw_notes(frame: &mut Frame, app: &App, selected: usize) {
+    let mut lines: Vec<Line> = Vec::new();
+    if app.notes.is_empty() {
+        lines.push(Line::styled("  no notes — n to draft one", DIM));
+    }
+    for (i, n) in app.notes.iter().enumerate() {
+        let style = if i == selected { ACTIVE } else { NORMAL };
+        let marker = if i == selected { "▸" } else { " " };
+        let pin = if n.pinned { "*" } else { " " };
+        let mut text = format!(" {marker}{pin}[{:<9}] {}", n.state, n.title);
+        text.truncate(70);
+        lines.push(Line::styled(text, style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  n new · e edit · f finalize · Enter send to active session",
+        DIM,
+    ));
+    let area = centered(frame, 74, (lines.len() as u16 + 2).max(6));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(modal_block("notes")), area);
+}
+
+fn draw_editor(frame: &mut Frame, title: &str, first: &str, body: &str, editing_body: bool) {
+    let (first_style, body_style) = if editing_body { (NORMAL, ACTIVE) } else { (ACTIVE, NORMAL) };
+    let mut lines = vec![
+        Line::styled(format!("{first}{}", if editing_body { "" } else { "▎" }), first_style),
+        Line::styled("─".repeat(66), DIM),
+    ];
+    for l in body.split('\n') {
+        lines.push(Line::styled(l.to_string(), body_style));
+    }
+    if editing_body {
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::styled("▎", ACTIVE));
+        }
+    }
+    let area = centered(frame, 70, (lines.len() as u16 + 2).clamp(8, 24));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(modal_block(title)), area);
+}
+
+fn draw_palette(frame: &mut Frame, app: &App, query: &str, selected: usize) {
+    let filtered = app.filtered_prompts(query);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("  ❯ ", DIM),
+            Span::styled(query.to_string(), ACTIVE),
+            Span::styled("▎", ACTIVE),
+        ]),
+        Line::styled("─".repeat(66), DIM),
+    ];
+    if filtered.is_empty() {
+        lines.push(Line::styled("  no matches — Ctrl+n to add a prompt", DIM));
+    }
+    for (i, p) in filtered.iter().take(12).enumerate() {
+        let style = if i == selected { ACTIVE } else { NORMAL };
+        let marker = if i == selected { "▸" } else { " " };
+        let preview: String = p.body.split('\n').next().unwrap_or("").chars().take(34).collect();
+        let mut text = format!(" {marker} {:<18} {preview}", p.label);
+        text.truncate(68);
+        lines.push(Line::styled(text, style));
+    }
+    let area = centered(frame, 70, (lines.len() as u16 + 2).max(7));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(modal_block("prompts — Enter pastes into active session")),
         area,
     );
 }

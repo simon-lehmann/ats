@@ -239,6 +239,9 @@ impl Store {
                     path: r.get(3)?,
                     branch: r.get(4)?,
                     status: ws_status_from_str(&r.get::<_, String>(5)?),
+                    dirty: None,
+                    ahead: None,
+                    behind: None,
                 })
             },
         )
@@ -272,6 +275,9 @@ impl Store {
                 path: r.get(3)?,
                 branch: r.get(4)?,
                 status: ws_status_from_str(&r.get::<_, String>(5)?),
+                dirty: None,
+                ahead: None,
+                behind: None,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -316,6 +322,63 @@ impl Store {
             params![id, state_to_str(state), detail],
         )?;
         Ok(())
+    }
+
+    pub fn session_transcript(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT transcript_path FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
+    pub fn set_session_transcript(&self, id: i64, path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET transcript_path = ?2 WHERE id = ?1",
+            params![id, path],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_prompt(&self, id: Option<i64>, label: &str, body: &str, kind: &str) -> Result<PromptInfo> {
+        let conn = self.conn.lock().unwrap();
+        let kind = if kind == "reentry" { "reentry" } else { "clipboard" };
+        let id = match id {
+            Some(id) => {
+                conn.execute(
+                    "UPDATE prompts SET label = ?2, body = ?3, kind = ?4 WHERE id = ?1",
+                    params![id, label, body, kind],
+                )?;
+                id
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO prompts (label, body, kind, use_count, last_used_at)
+                     VALUES (?1, ?2, ?3, 0, ?4)",
+                    params![label, body, kind, now()],
+                )?;
+                conn.last_insert_rowid()
+            }
+        };
+        conn.query_row(
+            "SELECT id, label, body, kind, use_count FROM prompts WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(PromptInfo {
+                    id: r.get(0)?,
+                    label: r.get(1)?,
+                    body: r.get(2)?,
+                    kind: r.get(3)?,
+                    use_count: r.get(4)?,
+                })
+            },
+        )
+        .map_err(Into::into)
     }
 
     pub fn set_session_pid(&self, id: i64, pid: u32) -> Result<()> {

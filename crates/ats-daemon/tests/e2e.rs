@@ -153,6 +153,86 @@ async fn full_spawn_flow_over_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn quiet_session_with_question_transcript_becomes_needs_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    // fake Claude home so transcript discovery looks where we control
+    std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path().join("claude-home"));
+    let socket_str = tmp.path().join("ats-q.sock").to_string_lossy().into_owned();
+    let template_dir = tmp.path().join("template");
+    make_template(&template_dir).await;
+
+    let mut config = Config::default();
+    config.daemon.workspaces_root =
+        tmp.path().join("workspaces").to_string_lossy().into_owned();
+    config.daemon.session_cmd = "sh -c 'echo up; sleep 30'".into();
+    config.daemon.idle_threshold_secs = 1;
+
+    let store = Arc::new(Store::open(&tmp.path().join("ats.db")).unwrap());
+    let daemon = Arc::new(server::Daemon::new(config, store, tmp.path().join("data")));
+    let server_handle = tokio::spawn({
+        let daemon = daemon.clone();
+        let s = socket_str.clone();
+        async move { server::serve(daemon, &s).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = Client::connect(&socket_str).await.unwrap();
+    let resp = client
+        .request(Request::RegisterTemplate {
+            name: "demo".into(),
+            path: template_dir.to_string_lossy().into_owned(),
+            setup_cmd: None,
+        })
+        .await
+        .unwrap();
+    let Response::Template { template } = resp else { panic!() };
+
+    // fabricate the Claude Code transcript BEFORE spawning (the first
+    // workspace path is deterministic): the agent asked a question and
+    // went quiet. Writing it first avoids racing the idle sweep.
+    let ws_path = tmp.path().join("workspaces").join("demo-1");
+    let proj = ats_daemon::transcript::project_dir_for_cwd(
+        &tmp.path().join("claude-home"),
+        &ws_path.to_string_lossy(),
+    );
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("abc.jsonl"),
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Should I delete the legacy module?"}]}}
+"#,
+    )
+    .unwrap();
+
+    let mut events = client.subscribe_events();
+    let resp = client
+        .request(Request::SpawnSession {
+            template_id: template.id,
+            tab_slot: None,
+            kickoff_note_id: None,
+        })
+        .await
+        .unwrap();
+    let Response::Session { session } = resp else { panic!() };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let ev = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("timed out waiting for needs_input")
+            .expect("event stream closed");
+        if let Event::SessionStateChanged { session_id, state, detail } = ev {
+            if session_id == session.id && state == SessionState::NeedsInput {
+                assert_eq!(detail.as_deref(), Some("Should I delete the legacy module?"));
+                break;
+            }
+        }
+    }
+
+    let _ = client.request(Request::KillSession { session_id: session.id }).await;
+    server_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn idle_heartbeat_fires() {
     let tmp = tempfile::tempdir().unwrap();
     let socket_str = tmp.path().join("ats-idle.sock").to_string_lossy().into_owned();

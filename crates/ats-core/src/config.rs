@@ -42,6 +42,11 @@ pub struct OrchestratorConfig {
     pub auto_digest: bool,
     /// API endpoint override (tests, proxies). Default: https://api.anthropic.com
     pub base_url: Option<String>,
+    /// Serve the ATS tools as an MCP server (loopback) for Claude Code
+    /// sessions — the orchestrator drives the daemon through this.
+    pub mcp_enabled: bool,
+    /// Loopback port for the MCP HTTP endpoint (`127.0.0.1:<port>/mcp`).
+    pub mcp_port: u16,
 }
 
 impl Default for OrchestratorConfig {
@@ -50,6 +55,8 @@ impl Default for OrchestratorConfig {
             model: "claude-haiku-4-5".into(),
             auto_digest: false,
             base_url: None,
+            mcp_enabled: true,
+            mcp_port: 8765,
         }
     }
 }

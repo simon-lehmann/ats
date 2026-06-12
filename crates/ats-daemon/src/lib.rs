@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod clone;
+pub mod mcp;
 pub mod orchestrator;
 pub mod server;
 pub mod session;

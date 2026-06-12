@@ -35,13 +35,6 @@ pub enum Modal {
     },
     /// fuzzy prompt palette for Alt+p
     Palette { query: String, selected: usize },
-    /// interactive orchestrator chat for Alt+o
-    Orchestrator {
-        input: String,
-        /// chat + tool-progress lines ("you: …", "orch: …", "→ tool …")
-        log: Vec<String>,
-        busy: bool,
-    },
     /// harvest diff viewer for Alt+h
     Diff {
         title: String,
@@ -98,8 +91,6 @@ pub struct App {
 pub enum AsyncMsg {
     /// show in the status line
     Status(String),
-    /// answer for the orchestrator panel
-    Answer(Result<String, String>),
     /// harvest result for the diff viewer
     Diff { title: String, content: String },
 }
@@ -134,16 +125,6 @@ impl App {
     pub fn apply_async(&mut self, msg: AsyncMsg) {
         match msg {
             AsyncMsg::Status(s) => self.status_line = s,
-            AsyncMsg::Answer(result) => {
-                if let Modal::Orchestrator { log, busy, .. } = &mut self.modal {
-                    *busy = false;
-                    match result {
-                        // the final text already arrived as a progress line
-                        Ok(_) => {}
-                        Err(e) => log.push(format!("error: {e}")),
-                    }
-                }
-            }
             AsyncMsg::Diff { title, content } => {
                 self.modal = Modal::Diff {
                     title,
@@ -151,15 +132,6 @@ impl App {
                     scroll: 0,
                 };
             }
-        }
-    }
-
-    /// Live tool-call progress from the daemon's orchestrator agent.
-    pub fn push_orchestrator_progress(&mut self, text: String) {
-        if let Modal::Orchestrator { log, .. } = &mut self.modal {
-            log.push(text);
-        } else {
-            self.status_line = format!("orch: {text}");
         }
     }
 

@@ -1,61 +1,22 @@
-//! Interactive orchestrator: a tool-using agent loop over the daemon's own
-//! capabilities. The developer talks to it (Alt+o / `ats orch`); it can do
-//! setup (register templates), spawn sessions, instruct or broadcast to
-//! sessions, read what they're doing, and harvest results.
+//! The ATS tool surface: declarations (`tools`) and execution (`execute_tool`)
+//! for the daemon's own capabilities — register templates, spawn sessions,
+//! instruct/broadcast, read progress, harvest, manage notes & prompts.
 //!
-//! Conversation history persists in the daemon until `OrchestratorReset`.
-//! Progress (each tool call) is pushed as `OrchestratorProgress` events so
-//! clients can show it live.
+//! These are served to the orchestrator (and any Claude Code session) over the
+//! MCP server (`crate::mcp`); `guardrail_block` gates destructive tools.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use ats_core::rpc::Event;
 use serde_json::{json, Value};
 
 use crate::server::Daemon;
 use crate::transcript;
 
-/// Hard cap on tool-call rounds per instruction — a runaway-loop backstop.
-const MAX_ROUNDS: usize = 12;
 /// Tool results are truncated to keep the context bounded.
 const RESULT_MAX: usize = 4000;
-/// History cap (messages); oldest turns are dropped beyond this.
-const HISTORY_MAX: usize = 60;
 
-const SYSTEM: &str = "You are the orchestrator of ATS (Agent Terminal Suite). You manage \
-coding-agent sessions (Claude Code CLIs running in PTYs) on the developer's machine. \
-Use your tools to carry out the developer's instructions: register template repos, \
-spawn sessions, send instructions to sessions, check on progress, harvest results.
-
-How ATS work is organized:
-- Notes are the task backlog. States: draft -> finalized (ready to hand out) -> \
-claimed (assigned to a session) -> done. When the developer describes work to plan, \
-capture it as notes: one note per independent task, title = short imperative summary, \
-body = a complete self-contained brief an agent can act on without other context. \
-Finalize notes that are ready; use send_note to assign one to a session (this types \
-the body into the agent and marks the note claimed).
-- Prompts are a reusable clipboard of messages the developer sends often (re-entry \
-asks, status checks). Save one when the developer repeats themselves.
-- Each session runs in its own cloned workspace on its own git branch; harvest \
-diffs a workspace against its spawn-time base and writes a patch file.
-- Session states: working (output flowing), idle (quiet), finished (reported back), \
-needs_input (asked a question or wants a permission), dead (exited).
-
-Conventions:
-- When instructing a session, write the message exactly as it should reach the \
-agent: complete, self-contained prompts. Sessions cannot see each other.
-- To run a workflow across sessions, instruct each one (or broadcast). For 'split \
-this work', first write finalized notes, then spawn/assign one session per note.
-- For planning, triage, or research that should not happen inside a project \
-workspace, use spawn_planning_session: a bare agent session in a scratch \
-directory (or any cwd you name, e.g. an existing workspace to inspect it). It \
-takes a normal tab; use it to draft plans you then turn into notes.
-- Prefer acting over asking; only ask the developer when genuinely ambiguous. \
-Never kill sessions or destroy/reset workspaces unless explicitly told to.
-- Be brief in replies: what you did, and anything that needs the developer.";
-
-fn tools() -> Value {
+pub(crate) fn tools() -> Value {
     json!([
         {
             "name": "list_templates",
@@ -124,9 +85,10 @@ fn tools() -> Value {
         },
         {
             "name": "kill_session",
-            "description": "Terminate a session's agent process. The workspace and its changes remain. Only when the developer asked for it.",
+            "description": "Terminate a session's agent process. The workspace and its changes remain. DESTRUCTIVE: only when the developer asked for it; requires confirm=true.",
             "input_schema": {"type": "object", "properties": {
-                "session_id": {"type": "integer"}
+                "session_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "description": "must be true; set only after the developer explicitly asked to kill this session"}
             }, "required": ["session_id"]}
         },
         {
@@ -180,19 +142,57 @@ fn tools() -> Value {
         },
         {
             "name": "reset_workspace",
-            "description": "Discard ALL changes in a workspace (git reset --hard + clean). Destructive; only when the developer asked for it.",
+            "description": "Discard ALL changes in a workspace (git reset --hard + clean). DESTRUCTIVE: only when the developer asked for it; requires confirm=true.",
             "input_schema": {"type": "object", "properties": {
-                "workspace_id": {"type": "integer"}
+                "workspace_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "description": "must be true; set only after the developer explicitly asked to reset this workspace"}
             }, "required": ["workspace_id"]}
         },
         {
             "name": "destroy_workspace",
-            "description": "Kill the workspace's sessions and delete its directory. Destructive and irreversible; only when the developer asked for it.",
+            "description": "Kill the workspace's sessions and delete its directory. DESTRUCTIVE and irreversible: only when the developer asked for it; requires confirm=true.",
             "input_schema": {"type": "object", "properties": {
-                "workspace_id": {"type": "integer"}
+                "workspace_id": {"type": "integer"},
+                "confirm": {"type": "boolean", "description": "must be true; set only after the developer explicitly asked to destroy this workspace"}
             }, "required": ["workspace_id"]}
         }
     ])
+}
+
+/// Tools that mutate fleet state irreversibly.
+pub(crate) fn is_destructive(name: &str) -> bool {
+    matches!(name, "kill_session" | "reset_workspace" | "destroy_workspace")
+}
+
+/// Guardrail for destructive tools (option 1). Returns `Some(error)` when the
+/// call must be blocked, `None` when it may proceed: destructive tools require
+/// an explicit `confirm: true`, and may never target the orchestrator's own
+/// session/workspace (so an agent can't kill the thing coordinating it).
+pub(crate) fn guardrail_block(daemon: &Arc<Daemon>, name: &str, input: &Value) -> Option<String> {
+    if !is_destructive(name) {
+        return None;
+    }
+    if input.get("confirm").and_then(Value::as_bool) != Some(true) {
+        return Some(format!(
+            "'{name}' is destructive and was not confirmed. Confirm with the developer \
+             first, then call again with \"confirm\": true."
+        ));
+    }
+    if let Ok(Some(orch)) = daemon.store.orchestrator_session() {
+        let targets_orch = match name {
+            "kill_session" => input.get("session_id").and_then(Value::as_i64) == Some(orch.id),
+            "reset_workspace" | "destroy_workspace" => {
+                input.get("workspace_id").and_then(Value::as_i64) == Some(orch.workspace_id)
+            }
+            _ => false,
+        };
+        if targets_orch {
+            return Some(format!(
+                "'{name}' refused: that targets the orchestrator's own session/workspace."
+            ));
+        }
+    }
+    None
 }
 
 fn truncate(s: String) -> String {
@@ -203,7 +203,7 @@ fn truncate(s: String) -> String {
     format!("{cut}\n[truncated]")
 }
 
-async fn execute_tool(daemon: &Arc<Daemon>, name: &str, input: &Value) -> Result<String> {
+pub(crate) async fn execute_tool(daemon: &Arc<Daemon>, name: &str, input: &Value) -> Result<String> {
     let int = |k: &str| -> Result<i64> {
         input
             .get(k)
@@ -535,6 +535,34 @@ mod tests {
         assert!(execute_tool(&d, "rm_rf_slash", &json!({})).await.is_err());
     }
 
+    #[tokio::test]
+    async fn guardrail_requires_confirm_on_destructive_tools() {
+        let d = daemon();
+        // read-only tools are never gated
+        assert!(guardrail_block(&d, "list_sessions", &json!({})).is_none());
+        // destructive without confirm → blocked
+        assert!(guardrail_block(&d, "destroy_workspace", &json!({"workspace_id": 1})).is_some());
+        // destructive with confirm → guardrail passes (execution may still error)
+        assert!(guardrail_block(&d, "destroy_workspace", &json!({"workspace_id": 1, "confirm": true})).is_none());
+    }
+
+    #[tokio::test]
+    async fn guardrail_protects_the_orchestrator_session() {
+        let d = daemon();
+        let t = d.store.insert_template("scratch", "/tmp", None, None, None).unwrap();
+        let ws = d
+            .store
+            .insert_workspace(t.id, "/tmp/orch", ats_core::state::WorkspaceStatus::Ready)
+            .unwrap();
+        let sid = d.store.insert_session(ws, None, None, None).unwrap();
+        d.store.mark_orchestrator(sid).unwrap();
+        // confirmed, but targeting the orchestrator's own session/workspace → refused
+        assert!(guardrail_block(&d, "kill_session", &json!({"session_id": sid, "confirm": true})).is_some());
+        assert!(guardrail_block(&d, "destroy_workspace", &json!({"workspace_id": ws, "confirm": true})).is_some());
+        // a different workspace is allowed
+        assert!(guardrail_block(&d, "destroy_workspace", &json!({"workspace_id": ws + 999, "confirm": true})).is_none());
+    }
+
     #[test]
     fn every_declared_tool_has_a_handler_arm() {
         // keep tools() and execute_tool in sync: names declared to the model
@@ -558,99 +586,4 @@ mod tests {
         }
         assert_eq!(declared.len(), HANDLED.len());
     }
-}
-
-fn progress(daemon: &Daemon, text: String) {
-    let _ = daemon.events.send(Event::OrchestratorProgress { text });
-}
-
-/// One developer message → agent loop until the model stops calling tools.
-/// Returns the model's final text. History lives in the daemon.
-pub async fn chat(daemon: &Arc<Daemon>, message: String) -> Result<String> {
-    // one conversation at a time; concurrent requests queue here
-    let mut history = daemon.orchestrator_history.lock().await;
-    history.push(json!({"role": "user", "content": message}));
-
-    let mut final_text = String::new();
-    for round in 0..MAX_ROUNDS {
-        let body = daemon
-            .orchestrator
-            .messages_payload(&history, &tools(), SYSTEM)
-            .await;
-        let body = match body {
-            Ok(b) => b,
-            Err(e) => {
-                // don't poison the history with a half-finished turn
-                history.pop();
-                return Err(e);
-            }
-        };
-        let content = body
-            .get("content")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let stop = body.get("stop_reason").and_then(Value::as_str).unwrap_or("");
-
-        history.push(json!({"role": "assistant", "content": content}));
-
-        let mut tool_results = Vec::new();
-        for block in &content {
-            match block.get("type").and_then(Value::as_str) {
-                Some("text") => {
-                    if let Some(t) = block.get("text").and_then(Value::as_str) {
-                        if !t.trim().is_empty() {
-                            final_text = t.trim().to_string();
-                            progress(daemon, final_text.clone());
-                        }
-                    }
-                }
-                Some("tool_use") => {
-                    let name = block.get("name").and_then(Value::as_str).unwrap_or("?");
-                    let id = block.get("id").and_then(Value::as_str).unwrap_or("");
-                    let input = block.get("input").cloned().unwrap_or(json!({}));
-                    progress(daemon, format!("→ {name} {input}"));
-                    let (result, is_error) = match execute_tool(daemon, name, &input).await {
-                        Ok(r) => (truncate(r), false),
-                        Err(e) => (format!("error: {e:#}"), true),
-                    };
-                    progress(daemon, format!("← {}", result.lines().next().unwrap_or("")));
-                    tool_results.push(json!({
-                        "type": "tool_result",
-                        "tool_use_id": id,
-                        "content": result,
-                        "is_error": is_error,
-                    }));
-                }
-                _ => {}
-            }
-        }
-
-        if stop != "tool_use" || tool_results.is_empty() {
-            break;
-        }
-        history.push(json!({"role": "user", "content": tool_results}));
-        if round == MAX_ROUNDS - 1 {
-            final_text.push_str("\n[stopped: tool-call limit reached]");
-        }
-    }
-
-    // keep the conversation bounded
-    let len = history.len();
-    if len > HISTORY_MAX {
-        history.drain(..len - HISTORY_MAX);
-        // history must start with a user message for the API
-        while history
-            .first()
-            .map(|m| m["role"] != "user" || m["content"].is_array())
-            .unwrap_or(false)
-        {
-            history.remove(0);
-        }
-    }
-
-    if final_text.is_empty() {
-        final_text = "(no reply)".into();
-    }
-    Ok(final_text)
 }

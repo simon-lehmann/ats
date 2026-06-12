@@ -45,9 +45,9 @@ ATS is built around a few non-negotiable principles:
 
 ## The orchestrator
 
-`Alt+o` (or `ats orch "..."`) opens a persistent chat with an agent that has
-tools over the daemon itself. Instead of doing setup and coordination by
-hand, you delegate it:
+`Alt+o` jumps to the **orchestrator** — itself a Claude Code session that
+drives the daemon through ATS's tools (exposed as an MCP server). Instead of
+doing setup and coordination by hand, you talk to it:
 
 ```
 ❯ register ~/repos/api-core as api-core, spawn a planning session,
@@ -60,20 +60,33 @@ hand, you delegate it:
 It knows the ATS workflow: **notes** are the task backlog (draft → finalized
 → claimed by a session → done), **planning sessions** are bare agents in a
 scratch dir for thinking outside any workspace, and **harvest** diffs a
-workspace against its spawn-time base into a patch file. Tool calls stream
-live into the panel (`→ spawn_session {…}`), the conversation persists in
-the daemon, and destructive tools (kill/reset/destroy) only fire when you
-explicitly ask. Requires `ANTHROPIC_API_KEY`; everything else works without.
+workspace against its spawn-time base into a patch file. Destructive tools
+(kill/reset/destroy) need an explicit `confirm` and refuse to touch the
+orchestrator itself.
+
+Because it's an ordinary Claude Code session, it uses your existing `claude`
+auth — **no `ANTHROPIC_API_KEY` needed**. The tools reach it via a loopback
+MCP server registered once at user scope (`ats mcp register`, or done for you
+on first launch). On a fresh machine with nothing registered, ATS opens the
+orchestrator automatically and it walks you through your first repo — so you
+never have to learn `ats register` to get going.
 
 ## Quick start
 
 ```sh
-cargo install --path crates/ats-cli --path crates/ats-daemon --path crates/ats-tui
+# one --path per crate (cargo install takes a single --path)
+cargo install --path crates/ats-daemon
+cargo install --path crates/ats-tui
+cargo install --path crates/ats-cli
 
-ats register api-core ~/repos/api-core   # template = setup-complete local clone
 ats-tui                                  # auto-starts the daemon
-# inside: Alt+s → pick template → agent running in the next free tab. F1 = help.
+# fresh machine: the orchestrator opens and sets up your first repo by chat.
+# or do it by hand: Alt+s → pick template → agent in the next free tab. F1 = help.
 ```
+
+Prefer to register manually? `ats register api-core ~/repos/api-core` blesses a
+setup-complete local clone as a template. To wire the orchestrator's tools into
+Claude Code yourself: `ats mcp register`.
 
 Headless / scripting:
 
@@ -96,7 +109,7 @@ ats scratch --kickoff "review the open PRs and summarize"
 | `Alt+q` | review queue — what needs you, with the question verbatim |
 | `Alt+n` | notes: draft, finalize, send to session |
 | `Alt+p` | prompt clipboard (fuzzy, frecency-sorted) |
-| `Alt+o` | orchestrator chat |
+| `Alt+o` | jump to the orchestrator (a Claude Code session with ATS tools) |
 | `Alt+d` | one-line digest of the active session |
 | `Alt+h` | harvest active workspace → scrollable diff viewer |
 | `Alt+Esc` | raw mode (every key goes to the PTY) |
@@ -112,7 +125,8 @@ Claude Code's own UI, colors, and prompts work inside it.
 ats-tui ─┐                      ┌─ SessionManager   PTY per agent (portable-pty)
 ats-cli ─┼─ JSON-RPC over local ┼─ CloneManager     templates → workspaces (CoW copy)
   ...   ─┘  socket / named pipe └─ TranscriptWatcher tails Claude Code JSONL → status
-            (any # of clients)  ┌─ Orchestrator     digests, chat-with-tools (Anthropic API)
+            (any # of clients)  ├─ MCP server       ATS tools → Claude Code (loopback)
+                                ├─ Orchestrator     on-demand digests/ask (Anthropic API)
                 ats-daemon ─────┴─ Store            SQLite: sessions, notes, prompts
 ```
 

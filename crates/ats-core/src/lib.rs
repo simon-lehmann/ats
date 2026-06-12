@@ -24,8 +24,41 @@ pub fn default_socket_path() -> String {
     }
     #[cfg(windows)]
     {
-        "ats.sock".to_string()
+        // Named pipe in file-path form: every call site builds the name with
+        // `GenericFilePath`, which requires a `\\.\pipe\...` path on Windows.
+        r"\\.\pipe\ats".to_string()
     }
+}
+
+/// Run the Claude Code CLI with `args`, returning its captured output. On
+/// Windows this goes through `cmd /C` so a `claude.cmd`/`claude.ps1` shim on
+/// PATH resolves (a bare `Command::new("claude")` would not find it).
+pub fn run_claude(args: &[&str]) -> std::io::Result<std::process::Output> {
+    #[cfg(windows)]
+    {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg("claude").args(args);
+        c.output()
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("claude").args(args).output()
+    }
+}
+
+/// The `claude mcp add` command that registers the ATS MCP server at user
+/// scope for the given loopback port (shown to the user, run by the CLI).
+pub fn mcp_register_args(port: u16) -> Vec<String> {
+    vec![
+        "mcp".into(),
+        "add".into(),
+        "--scope".into(),
+        "user".into(),
+        "--transport".into(),
+        "http".into(),
+        "ats".into(),
+        format!("http://127.0.0.1:{port}/mcp"),
+    ]
 }
 
 /// Data directory for the daemon (SQLite db, harvest patches, logs).

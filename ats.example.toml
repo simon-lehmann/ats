@@ -6,10 +6,12 @@ scrollback_lines = 10000
 idle_threshold_secs = 8
 
 [orchestrator]
-model = "claude-haiku-4-5"
+model = "claude-haiku-4-5"    # used by the on-demand digest/ask helpers
 auto_digest = false           # calm by default
 # base_url = "https://api.anthropic.com"   # override for proxies/tests
-# API key comes from $ANTHROPIC_API_KEY
+# API key (digest/ask only) comes from $ANTHROPIC_API_KEY
+mcp_enabled = true            # serve the ATS tools to Claude Code sessions
+mcp_port = 8765               # loopback MCP endpoint: 127.0.0.1:<port>/mcp
 
 [ui]
 rail_width = 28

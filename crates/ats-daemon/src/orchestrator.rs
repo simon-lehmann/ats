@@ -61,23 +61,6 @@ impl Orchestrator {
         Ok(body)
     }
 
-    /// Tool-enabled call for the interactive agent loop (crate::agent).
-    pub(crate) async fn messages_payload(
-        &self,
-        history: &[Value],
-        tools: &Value,
-        system: &str,
-    ) -> Result<Value> {
-        self.messages(json!({
-            "model": self.model,
-            "max_tokens": 4096,
-            "system": system,
-            "tools": tools,
-            "messages": history,
-        }))
-        .await
-    }
-
     async fn complete(&self, system: &str, user: &str) -> Result<String> {
         let body = self
             .messages(json!({

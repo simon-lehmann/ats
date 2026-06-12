@@ -25,6 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # daemon
+axum = "0.7"
 portable-pty = "0.8"
 vt100 = "0.15"
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use ats_core::client::Client;
 use ats_core::config::Config;
-use ats_core::rpc::Event;
+use ats_core::rpc::{Event, Request, Response};
 use crossterm::event::{Event as CtEvent, EventStream, KeyEventKind};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -99,6 +99,31 @@ async fn run(
     let mut async_rx = app.async_rx.take().expect("fresh App has the receiver");
     app.refresh().await?;
 
+    // cold start: nothing registered and no orchestrator yet → open the
+    // orchestrator with an onboarding kickoff so first-run setup happens by
+    // conversation instead of `ats register`. (Skip on a second-monitor client.)
+    if !app.solo && app.templates.is_empty() && !app.sessions.iter().any(|s| s.is_orchestrator) {
+        let kickoff = "No repos are registered with ATS yet. Greet the developer in one \
+            line, ask which local git repo they want you to manage, then register it as a \
+            template and spawn a session in it."
+            .to_string();
+        if let Ok(Response::Session { session }) =
+            client.request(Request::EnsureOrchestrator { kickoff: Some(kickoff) }).await
+        {
+            app.refresh().await?;
+            if let Some(slot) = session.tab_slot {
+                if slot <= app.a_slots {
+                    app.active_a = slot;
+                    app.focus = app::Focus::GroupA;
+                } else {
+                    app.active_b = slot;
+                    app.focus = app::Focus::GroupB;
+                }
+            }
+            app.status_line = "orchestrator ready — type to it; it'll set up your first repo".into();
+        }
+    }
+
     let mut events = client.subscribe_events();
     let mut term_events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(2000));
@@ -153,9 +178,6 @@ async fn run(
                     }
                     Ok(Event::DigestReady { session_id, summary }) => {
                         app.status_line = format!("digest [{session_id}]: {summary}");
-                    }
-                    Ok(Event::OrchestratorProgress { text }) => {
-                        app.push_orchestrator_progress(text);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {

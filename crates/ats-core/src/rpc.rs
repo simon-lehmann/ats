@@ -79,11 +79,9 @@ pub enum Request {
     },
     /// LLM-drafted catch-up note for re-entering a session
     DraftReentry { session_id: i64 },
-    /// Conversational orchestrator with tools: it can register templates,
-    /// spawn sessions, instruct/broadcast, read transcripts, harvest.
-    OrchestratorChat { message: String },
-    /// Clear the orchestrator's conversation history
-    OrchestratorReset,
+    /// Ensure the orchestrator Claude Code session exists (spawning it with an
+    /// optional kickoff if absent) and return it. Idempotent.
+    EnsureOrchestrator { kickoff: Option<String> },
     ListReviewQueue,
 }
 
@@ -162,8 +160,6 @@ pub enum Event {
         workspace_id: i64,
         status: WorkspaceStatus,
     },
-    /// live progress from an orchestrator chat turn (tool calls, thoughts)
-    OrchestratorProgress { text: String },
 }
 
 /// Anything the daemon writes to a client: a response or a pushed event.
@@ -190,6 +186,10 @@ pub struct SessionInfo {
     pub workspace_path: String,
     pub created_at: i64,
     pub last_activity_at: i64,
+    /// True for the overarching orchestrator session (Alt+o). Protected from
+    /// destructive tools; reachable via `EnsureOrchestrator`.
+    #[serde(default)]
+    pub is_orchestrator: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

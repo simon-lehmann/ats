@@ -27,12 +27,43 @@ pub struct Daemon {
     pub clones: CloneManager,
     pub data_dir: PathBuf,
     pub orchestrator: crate::orchestrator::Orchestrator,
-    /// interactive-orchestrator conversation (crate::agent); the lock also
-    /// serializes chat turns
-    pub orchestrator_history: Mutex<Vec<serde_json::Value>>,
     pub events: broadcast::Sender<Event>,
     pub config: Config,
 }
+
+/// Dropped into the orchestrator session's cwd so Claude Code reads it as
+/// project context: who it is and how ATS work is organized. The ATS tools
+/// themselves arrive via the user-scoped MCP server.
+const ORCHESTRATOR_CLAUDE_MD: &str = r#"# ATS Orchestrator
+
+You are the **orchestrator** of ATS (Agent Terminal Suite). You coordinate a
+fleet of coding-agent sessions (other Claude Code CLIs, each in its own PTY and
+git workspace) on the developer's machine, on their behalf.
+
+You drive the daemon through the **`ats` MCP tools** (register templates, spawn
+sessions, send/broadcast instructions, read progress, harvest results, manage
+notes & prompts). If you do not see those tools, the MCP server isn't registered
+yet — tell the developer to run `ats mcp register` and restart you.
+
+## How ATS work is organized
+- **Templates** are setup-complete local repos. `register_template {name, path}`
+  blesses one; spawning a session clones a fresh workspace from it on its own
+  branch. First-run: ask the developer which local repo to manage, then register
+  it and spawn a session.
+- **Notes** are the task backlog: draft → finalized → claimed → done. For "split
+  this work", write one finalized note per independent task (title = short
+  imperative, body = a complete self-contained brief), then assign one per
+  session with `send_note`.
+- **Sessions** states: working / idle / finished / needs_input / dead. Sessions
+  can't see each other — instruct each with complete, self-contained prompts.
+- **Planning** that shouldn't happen inside a repo: `spawn_planning_session`.
+
+## Conventions
+- Prefer acting over asking; only ask the developer when genuinely ambiguous.
+- Destructive tools (kill/reset/destroy) need `confirm: true` and only when the
+  developer explicitly asked. Never destroy your own session/workspace.
+- Be brief: what you did, and anything that needs the developer.
+"#;
 
 impl Daemon {
     pub fn new(config: Config, store: Arc<Store>, data_dir: PathBuf) -> Self {
@@ -51,7 +82,6 @@ impl Daemon {
             clones,
             data_dir,
             orchestrator,
-            orchestrator_history: Mutex::new(Vec::new()),
             events,
             config,
         }
@@ -190,6 +220,72 @@ impl Daemon {
             .get_session(session_id)?
             .ok_or_else(|| anyhow!("session vanished"))?;
         Ok(Response::Session { session })
+    }
+
+    /// Ensure the overarching orchestrator session exists, spawning it if not,
+    /// and return it. Idempotent: a live orchestrator is returned as-is. The
+    /// orchestrator is a bare Claude Code session in `<data_dir>/orchestrator`
+    /// (with a generated `CLAUDE.md`) that drives the daemon via the ATS MCP
+    /// tools. Flagged in the store so destructive tools protect it.
+    pub async fn ensure_orchestrator_session(
+        self: &Arc<Self>,
+        kickoff: Option<String>,
+    ) -> Result<Response> {
+        if let Some(existing) = self.store.orchestrator_session()? {
+            if self.sessions.is_live(existing.id) {
+                return Ok(Response::Session { session: existing });
+            }
+        }
+        if self.config.orchestrator.mcp_enabled {
+            self.ensure_mcp_registered().await;
+        }
+        let dir = self.data_dir.join("orchestrator");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating orchestrator dir {}", dir.display()))?;
+        std::fs::write(dir.join("CLAUDE.md"), ORCHESTRATOR_CLAUDE_MD)
+            .context("writing orchestrator CLAUDE.md")?;
+
+        let resp = self
+            .spawn_scratch_session(Some(dir.to_string_lossy().into_owned()), None, kickoff)
+            .await?;
+        if let Response::Session { session } = &resp {
+            self.store.mark_orchestrator(session.id)?;
+            if let Some(updated) = self.store.get_session(session.id)? {
+                return Ok(Response::Session { session: updated });
+            }
+        }
+        Ok(resp)
+    }
+
+    /// Best-effort: register the ATS MCP server with Claude Code at user scope,
+    /// once. Logs (never panics) if `claude` isn't on PATH — `ats mcp register`
+    /// is the explicit fallback. Writes to `~/.claude.json` (a global change).
+    async fn ensure_mcp_registered(&self) {
+        let port = self.config.orchestrator.mcp_port;
+        let _ = tokio::task::spawn_blocking(move || {
+            if ats_core::run_claude(&["mcp", "get", "ats"])
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                return; // already registered
+            }
+            let args = ats_core::mcp_register_args(port);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            match ats_core::run_claude(&refs) {
+                Ok(o) if o.status.success() => {
+                    tracing::info!(port, "registered ATS MCP server with Claude Code (user scope)")
+                }
+                Ok(o) => tracing::warn!(
+                    "claude mcp add failed ({}); run `ats mcp register` manually: {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => tracing::warn!(
+                    "could not run claude to register the MCP server ({e}); run `ats mcp register`"
+                ),
+            }
+        })
+        .await;
     }
 
     async fn dispatch(self: &Arc<Self>, req: Request, attached: &Mutex<HashSet<i64>>) -> Result<Response> {
@@ -348,13 +444,8 @@ impl Daemon {
                 let note = self.orchestrator.draft_reentry(&self.store, session_id).await?;
                 Ok(Response::Note { note })
             }
-            Request::OrchestratorChat { message } => {
-                let text = crate::agent::chat(self, message).await?;
-                Ok(Response::Answer { text })
-            }
-            Request::OrchestratorReset => {
-                self.orchestrator_history.lock().await.clear();
-                Ok(Response::Ok)
+            Request::EnsureOrchestrator { kickoff } => {
+                self.ensure_orchestrator_session(kickoff).await
             }
         }
     }
@@ -476,6 +567,17 @@ pub async fn serve(daemon: Arc<Daemon>, socket_path: &str) -> Result<()> {
         .create_tokio()
         .with_context(|| format!("binding local socket {socket_path}"))?;
     tracing::info!(socket = socket_path, "ats-daemon listening");
+
+    // MCP server: expose the ATS tools to Claude Code sessions over loopback.
+    if daemon.config.orchestrator.mcp_enabled {
+        let daemon = daemon.clone();
+        let port = daemon.config.orchestrator.mcp_port;
+        tokio::spawn(async move {
+            if let Err(e) = crate::mcp::serve(daemon, port).await {
+                tracing::error!("MCP server: {e:#}");
+            }
+        });
+    }
 
     // heartbeat sweep (plan §4.1) + transcript classification (plan §4.2):
     // quiet sessions get classified from their Claude Code JSONL tail;

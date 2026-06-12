@@ -88,21 +88,23 @@ enum Cmd {
     },
     /// Draft a re-entry briefing note for a session
     Reentry { session_id: i64 },
-    /// Talk to the interactive orchestrator: it registers templates,
-    /// spawns sessions, instructs and reads them on your behalf
-    Orch {
-        /// instruction; omit with --reset to just clear the conversation
-        message: Option<String>,
-        /// clear the orchestrator's conversation history first
-        #[arg(long)]
-        reset: bool,
-    },
+    /// Register/inspect the ATS MCP server with Claude Code (orchestrator tools)
+    #[command(subcommand)]
+    Mcp(McpCmd),
     /// Notes / plans
     #[command(subcommand)]
     Note(NoteCmd),
     /// Prompt clipboard
     #[command(subcommand)]
     Prompt(PromptCmd),
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Register the ATS MCP server with Claude Code at user scope (all projects)
+    Register,
+    /// Print the registration command without running it
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -127,6 +129,53 @@ enum PromptCmd {
     List,
     /// Paste a prompt into a session
     Use { id: i64, session_id: i64 },
+}
+
+/// The configured MCP port (`./ats.toml` → `<data_dir>/ats.toml` → default).
+fn mcp_port() -> u16 {
+    for path in [
+        std::path::PathBuf::from("ats.toml"),
+        ats_core::data_dir().join("ats.toml"),
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(cfg) = ats_core::config::Config::from_toml(&raw) {
+                return cfg.orchestrator.mcp_port;
+            }
+        }
+    }
+    ats_core::config::OrchestratorConfig::default().mcp_port
+}
+
+/// Register (or show how to register) the ATS MCP server with Claude Code.
+fn handle_mcp(cmd: &McpCmd) -> Result<()> {
+    let port = mcp_port();
+    let args = ats_core::mcp_register_args(port);
+    let cmdline = format!("claude {}", args.join(" "));
+    match cmd {
+        McpCmd::Show => {
+            println!("{cmdline}");
+            Ok(())
+        }
+        McpCmd::Register => {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            match ats_core::run_claude(&refs) {
+                Ok(o) if o.status.success() => {
+                    print!("{}", String::from_utf8_lossy(&o.stdout));
+                    println!(
+                        "registered the ATS MCP server with Claude Code (user scope, port {port}).\n\
+                         Open a Claude Code session and run /mcp to confirm `ats` is connected."
+                    );
+                    Ok(())
+                }
+                Ok(o) => bail!(
+                    "claude exited {}: {}\nrun it yourself: {cmdline}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => bail!("could not run claude ({e}).\nrun it yourself: {cmdline}"),
+            }
+        }
+    }
 }
 
 fn glyph(state: SessionState) -> &'static str {
@@ -165,6 +214,13 @@ async fn main() -> Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
+
+    // MCP registration talks to the Claude CLI, not the daemon — handle it
+    // before connecting so it works even with no daemon running.
+    if let Cmd::Mcp(cmd) = &cli.cmd {
+        return handle_mcp(cmd);
+    }
+
     let socket = cli.socket.unwrap_or_else(ats_core::default_socket_path);
     let client = Client::connect(&socket).await.map_err(|e| {
         anyhow!("{e:#}\nIs ats-daemon running? Start it with: ats-daemon")
@@ -382,29 +438,7 @@ async fn main() -> Result<()> {
                 println!("note {} — {}\n\n{}", note.id, note.title, note.body);
             }
         }
-        Cmd::Orch { message, reset } => {
-            if reset {
-                client.request(Request::OrchestratorReset).await?;
-                println!("conversation reset");
-            }
-            if let Some(message) = message {
-                // stream tool-call progress while the agent works
-                let mut events = client.subscribe_events();
-                let printer = tokio::spawn(async move {
-                    while let Ok(ev) = events.recv().await {
-                        if let ats_core::rpc::Event::OrchestratorProgress { text } = ev {
-                            eprintln!("  {text}");
-                        }
-                    }
-                });
-                let resp = client.request(Request::OrchestratorChat { message }).await;
-                printer.abort();
-                match resp? {
-                    Response::Answer { text } => println!("{text}"),
-                    other => bail!("unexpected response: {other:?}"),
-                }
-            }
-        }
+        Cmd::Mcp(_) => unreachable!("handled before connecting to the daemon"),
         Cmd::Note(cmd) => match cmd {
             NoteCmd::Add { title, body } => {
                 let body = if body == "-" {

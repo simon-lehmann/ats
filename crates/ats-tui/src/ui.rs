@@ -26,10 +26,7 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(1)])
         .split(frame.area());
-    frame.render_widget(
-        Paragraph::new(Line::styled(format!(" {}", app.status_line), DIM)),
-        vsplit[1],
-    );
+    draw_footer(frame, app, vsplit[1]);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -63,9 +60,6 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
             draw_editor(frame, "note — Tab title/body, Ctrl+s save", title, body, *editing_body)
         }
         Modal::Palette { query, selected } => draw_palette(frame, app, query, *selected),
-        Modal::Orchestrator { input, log, busy } => {
-            draw_orchestrator(frame, input, log, *busy)
-        }
         Modal::Diff { title, lines, scroll } => draw_diff(frame, title, lines, *scroll),
         Modal::PromptEdit { label, body, editing_body } => {
             draw_editor(frame, "prompt — Tab label/body, Ctrl+s save", label, body, *editing_body)
@@ -74,6 +68,89 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
     }
 
     PaneAreas { a_inner, b_inner }
+}
+
+/// Bottom strip: a transient status message when one is set, otherwise a
+/// vim-style context-sensitive key hint bar (keys bright-ish, labels dim).
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if !app.status_line.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!(" {}", app.status_line), NORMAL)),
+            area,
+        );
+        return;
+    }
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    for (i, (key, label)) in footer_hints(app).into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", DIM));
+        }
+        if !key.is_empty() {
+            spans.push(Span::styled(key, NORMAL));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(label, DIM));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The most relevant bindings for the current context. First entry of each
+/// pair is the key (omit for a plain note), second is what it does.
+fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    if app.raw_mode {
+        return vec![("Alt+Esc", "exit raw"), ("", "every key goes to the terminal")];
+    }
+    match &app.modal {
+        Modal::None => {
+            // cold start: no templates and nothing in a tab → steer to setup
+            let cold = app.templates.is_empty()
+                && app.sessions.iter().all(|s| s.tab_slot.is_none());
+            if cold {
+                return vec![
+                    ("Alt+o", "set up with the orchestrator"),
+                    ("Alt+s", "spawn"),
+                    ("F1", "help"),
+                ];
+            }
+            match app.focus {
+                Focus::Rail => vec![
+                    ("Alt+1-0", "tab"),
+                    ("Alt+s", "spawn"),
+                    ("Alt+q", "queue"),
+                    ("Enter", "back to panes"),
+                    ("F1", "help"),
+                ],
+                _ => vec![
+                    ("Alt+s", "spawn"),
+                    ("Alt+o", "orchestrator"),
+                    ("Alt+q", "queue"),
+                    ("Alt+n", "notes"),
+                    ("Alt+1-0", "tab"),
+                    ("Alt+x", "detach"),
+                    ("F1", "help"),
+                ],
+            }
+        }
+        Modal::Help => vec![("Esc", "close")],
+        Modal::Spawn { .. } => {
+            vec![("↑↓", "select"), ("Enter", "spawn"), ("p", "planning"), ("Esc", "close")]
+        }
+        Modal::Queue { .. } => vec![("↑↓", "select"), ("Enter", "jump"), ("Esc", "close")],
+        Modal::Notes { .. } => vec![
+            ("n", "new"),
+            ("e", "edit"),
+            ("f", "finalize"),
+            ("Enter", "send"),
+            ("Esc", "close"),
+        ],
+        Modal::NoteEdit { .. } | Modal::PromptEdit { .. } => {
+            vec![("Tab", "title/body"), ("Ctrl+s", "save"), ("Esc", "cancel")]
+        }
+        Modal::Palette { .. } => {
+            vec![("type", "filter"), ("Enter", "paste"), ("Ctrl+n", "add"), ("Esc", "close")]
+        }
+        Modal::Diff { .. } => vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "close")],
+    }
 }
 
 fn glyph_style(state: SessionState) -> Style {
@@ -195,9 +272,15 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
             }
             None => format!("{} —", slot_key_label(slot)),
         };
-        let tint = session
-            .and_then(|s| app.template_colors.get(&s.template_name))
-            .and_then(|name| parse_color(name));
+        // the orchestrator tab gets a calm magenta tint so Alt+o's target reads
+        // at a glance; other tabs use their per-template color if configured
+        let tint = if session.map(|s| s.is_orchestrator).unwrap_or(false) {
+            Some(Color::Magenta)
+        } else {
+            session
+                .and_then(|s| app.template_colors.get(&s.template_name))
+                .and_then(|name| parse_color(name))
+        };
         let style = if slot == active {
             if app.focus == group { ACTIVE } else { NORMAL }
         } else {
@@ -495,64 +578,6 @@ fn draw_palette(frame: &mut Frame, app: &App, query: &str, selected: usize) {
     frame.render_widget(
         Paragraph::new(lines).block(modal_block("prompts — Enter pastes into active session")),
         area,
-    );
-}
-
-fn draw_orchestrator(frame: &mut Frame, input: &str, log: &[String], busy: bool) {
-    let area = frame.area();
-    let w = area.width.saturating_sub(8).min(100);
-    let h = area.height.saturating_sub(4).min(30);
-    let view = centered(frame, w, h);
-    let wrap_at = w.saturating_sub(4) as usize;
-
-    // wrap the log, newest lines win the available space
-    let mut wrapped: Vec<Line> = Vec::new();
-    for entry in log {
-        let style = if entry.starts_with("you: ") {
-            ACTIVE
-        } else if entry.starts_with('→') || entry.starts_with('←') {
-            DIM
-        } else if entry.starts_with("error") {
-            ALERT
-        } else {
-            NORMAL
-        };
-        for raw in entry.lines() {
-            let mut rest: Vec<char> = raw.chars().collect();
-            loop {
-                let take: String = rest.iter().take(wrap_at).collect();
-                wrapped.push(Line::styled(format!("  {take}"), style));
-                if rest.len() <= wrap_at {
-                    break;
-                }
-                rest = rest.split_off(wrap_at);
-            }
-        }
-    }
-    let body = (h as usize).saturating_sub(4);
-    let mut lines: Vec<Line> = if log.is_empty() {
-        vec![
-            Line::styled("  tell the orchestrator what you want, e.g.:", DIM),
-            Line::styled("    register ~/repos/api-core as api-core", DIM),
-            Line::styled("    spawn 3 sessions and split the open notes between them", DIM),
-            Line::styled("    tell every working session to commit and report status", DIM),
-        ]
-    } else {
-        wrapped.split_off(wrapped.len().saturating_sub(body))
-    };
-    lines.push(Line::styled("─".repeat(wrap_at + 2), DIM));
-    lines.push(Line::from(vec![
-        Span::styled(if busy { "  ⋯ " } else { "  ❯ " }, DIM),
-        Span::styled(input.to_string(), ACTIVE),
-        Span::styled(if busy { "" } else { "▎" }, ACTIVE),
-    ]));
-
-    frame.render_widget(Clear, view);
-    frame.render_widget(
-        Paragraph::new(lines).block(modal_block(
-            "orchestrator — Enter send · Ctrl+r reset · Esc close (chat persists)",
-        )),
-        view,
     );
 }
 

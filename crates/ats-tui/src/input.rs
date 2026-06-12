@@ -79,6 +79,11 @@ fn digit_to_slot(c: char) -> Option<u8> {
 pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // status messages are transient: the next keypress clears the previous
+    // one so the footer falls back to the context hint bar. Handlers below
+    // may set a fresh status during this same call — that one survives.
+    app.status_line.clear();
+
     // raw mode: everything through, Alt+Esc leaves
     if app.raw_mode {
         if alt && key.code == KeyCode::Esc {
@@ -167,12 +172,21 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 }
                 return Ok(());
             }
+            // jump to the orchestrator Claude Code session (spawning it if
+            // needed); it drives the fleet via the ATS MCP tools
             KeyCode::Char('o') => {
-                app.modal = Modal::Orchestrator {
-                    input: String::new(),
-                    log: Vec::new(),
-                    busy: false,
-                };
+                app.status_line = "opening orchestrator…".into();
+                match app.client.request(Request::EnsureOrchestrator { kickoff: None }).await {
+                    Ok(ats_core::rpc::Response::Session { session }) => {
+                        app.refresh().await?;
+                        if let Some(slot) = session.tab_slot {
+                            jump_to_slot(app, slot);
+                        }
+                        app.status_line.clear();
+                    }
+                    Ok(_) => {}
+                    Err(e) => app.status_line = format!("orchestrator: {e:#}"),
+                }
                 return Ok(());
             }
             // digest of the active session, in the background
@@ -433,37 +447,6 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 KeyCode::Home => app.modal = Modal::Diff { title, lines, scroll: 0 },
                 KeyCode::End => app.modal = Modal::Diff { title, lines, scroll: max },
                 _ => app.modal = Modal::Diff { title, lines, scroll },
-            }
-        }
-        Modal::Orchestrator { mut input, mut log, busy } => {
-            if key.code == KeyCode::Esc {
-                // close; daemon keeps the conversation — Alt+o resumes it
-            } else if is_ctrl(&key, 'r') && !busy {
-                app.client.request(Request::OrchestratorReset).await?;
-                log.push("— conversation reset —".into());
-                app.modal = Modal::Orchestrator { input, log, busy };
-            } else if key.code == KeyCode::Enter && !busy && !input.trim().is_empty() {
-                let message = std::mem::take(&mut input);
-                log.push(format!("you: {message}"));
-                let client = app.client.clone();
-                let tx = app.async_tx.clone();
-                tokio::spawn(async move {
-                    let result = match client
-                        .request(Request::OrchestratorChat { message })
-                        .await
-                    {
-                        Ok(ats_core::rpc::Response::Answer { text }) => Ok(text),
-                        Ok(_) => Err("unexpected response".to_string()),
-                        Err(e) => Err(format!("{e:#}")),
-                    };
-                    let _ = tx.send(crate::app::AsyncMsg::Answer(result));
-                });
-                app.modal = Modal::Orchestrator { input, log, busy: true };
-            } else {
-                if !busy {
-                    edit_text(&mut input, &key);
-                }
-                app.modal = Modal::Orchestrator { input, log, busy };
             }
         }
         Modal::PromptEdit { mut label, mut body, editing_body } => {

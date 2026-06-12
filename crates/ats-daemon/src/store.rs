@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   state TEXT CHECK(state IN ('working','idle','finished','needs_input','error','dead')),
   state_detail TEXT,
   kickoff_note_id INTEGER,
+  is_orchestrator INTEGER DEFAULT 0,
   created_at INTEGER, last_activity_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS notes (
@@ -117,6 +118,7 @@ fn ws_status_from_str(s: &str) -> WorkspaceStatus {
 /// column already exists (fresh CREATE includes it).
 fn migrate(conn: &Connection) {
     let _ = conn.execute("ALTER TABLE templates ADD COLUMN kickoff_prompt TEXT", []);
+    let _ = conn.execute("ALTER TABLE sessions ADD COLUMN is_orchestrator INTEGER DEFAULT 0", []);
 }
 
 pub struct Store {
@@ -429,6 +431,28 @@ impl Store {
         Ok((1..=max_slots).find(|s| !used.contains(s)))
     }
 
+    /// Flag a session as the orchestrator (protected, reachable via Alt+o).
+    pub fn mark_orchestrator(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE sessions SET is_orchestrator = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// The live orchestrator session, if one exists (newest non-dead).
+    pub fn orchestrator_session(&self) -> Result<Option<SessionInfo>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!(
+                "{SESSION_SELECT} WHERE s.is_orchestrator = 1 AND s.state != 'dead' \
+                 ORDER BY s.id DESC LIMIT 1"
+            ),
+            [],
+            session_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn clear_dead_tab_slot(&self, session_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -548,7 +572,7 @@ impl Store {
 }
 
 const SESSION_SELECT: &str = "SELECT s.id, s.workspace_id, s.tab_slot, s.pty_pid, s.state,
-    s.state_detail, w.path, t.name, s.created_at, s.last_activity_at
+    s.state_detail, w.path, t.name, s.created_at, s.last_activity_at, s.is_orchestrator
     FROM sessions s
     JOIN workspaces w ON w.id = s.workspace_id
     JOIN templates t ON t.id = w.template_id";
@@ -583,6 +607,7 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
         template_name,
         created_at: r.get(8)?,
         last_activity_at: r.get(9)?,
+        is_orchestrator: r.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -637,6 +662,24 @@ mod tests {
         let s2 = store.insert_session(ws, Some(3), None, None).unwrap();
         store.set_session_state(s2, SessionState::Dead, None).unwrap();
         assert_eq!(store.next_free_tab_slot(10).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn orchestrator_flag_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        let t = store.insert_template("scratch", "/tmp", None, None, None).unwrap();
+        let ws = store.insert_workspace(t.id, "/tmp/o", WorkspaceStatus::Ready).unwrap();
+        let sid = store.insert_session(ws, Some(1), None, None).unwrap();
+
+        assert!(store.orchestrator_session().unwrap().is_none());
+        store.mark_orchestrator(sid).unwrap();
+        let o = store.orchestrator_session().unwrap().unwrap();
+        assert_eq!(o.id, sid);
+        assert!(o.is_orchestrator);
+
+        // a dead orchestrator is no longer returned (a fresh one can be spawned)
+        store.set_session_state(sid, SessionState::Dead, None).unwrap();
+        assert!(store.orchestrator_session().unwrap().is_none());
     }
 
     #[test]

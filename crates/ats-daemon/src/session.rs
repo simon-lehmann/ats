@@ -311,7 +311,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn spawn_echo_collect_output_then_dead() {
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let t = store.insert_template("t", "/tmp", None, None).unwrap();
+        let t = store.insert_template("t", "/tmp", None, None, None).unwrap();
         let ws = store
             .insert_workspace(t.id, "/tmp", ats_core::state::WorkspaceStatus::Ready)
             .unwrap();
@@ -360,7 +360,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn stdin_reaches_process() {
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let t = store.insert_template("t", "/tmp", None, None).unwrap();
+        let t = store.insert_template("t", "/tmp", None, None, None).unwrap();
         let ws = store
             .insert_workspace(t.id, "/tmp", ats_core::state::WorkspaceStatus::Ready)
             .unwrap();

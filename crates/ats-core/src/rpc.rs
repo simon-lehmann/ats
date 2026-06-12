@@ -38,6 +38,9 @@ pub enum Request {
         name: String,
         path: String,
         setup_cmd: Option<String>,
+        /// sent to new sessions in this template once the agent has booted
+        #[serde(default)]
+        kickoff_prompt: Option<String>,
     },
     ListWorkspaces,
     SpawnWorkspace { template_id: i64 },
@@ -166,6 +169,8 @@ pub struct SessionInfo {
     pub tab_slot: Option<u8>,
     pub pid: Option<u32>,
     pub title: String,
+    #[serde(default)]
+    pub template_name: String,
     pub state: SessionState,
     pub state_detail: Option<String>,
     pub workspace_path: String,
@@ -180,6 +185,8 @@ pub struct TemplateInfo {
     pub path: String,
     pub origin_url: Option<String>,
     pub setup_cmd: Option<String>,
+    #[serde(default)]
+    pub kickoff_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -41,6 +41,12 @@ pub enum Modal {
         answer: Option<String>,
         busy: bool,
     },
+    /// harvest diff viewer for Alt+h
+    Diff {
+        title: String,
+        lines: Vec<String>,
+        scroll: usize,
+    },
     /// minimal prompt editor
     PromptEdit {
         label: String,
@@ -71,6 +77,10 @@ pub struct App {
     pub a_slots: u8,
     pub b_slots: u8,
     pub modal: Modal,
+    /// single-group client (second monitor): render only the focused group
+    pub solo: bool,
+    /// calm per-template tab tinting from `[ui.template_colors]`
+    pub template_colors: HashMap<String, String>,
     /// everything-through mode: only the toggle key is intercepted
     pub raw_mode: bool,
     pub terms: HashMap<i64, Term>,
@@ -89,6 +99,8 @@ pub enum AsyncMsg {
     Status(String),
     /// answer for the orchestrator panel
     Answer(Result<String, String>),
+    /// harvest result for the diff viewer
+    Diff { title: String, content: String },
 }
 
 impl App {
@@ -107,6 +119,8 @@ impl App {
             a_slots,
             b_slots,
             modal: Modal::None,
+            solo: false,
+            template_colors: HashMap::new(),
             raw_mode: false,
             terms: HashMap::new(),
             status_line: String::new(),
@@ -128,6 +142,22 @@ impl App {
                     });
                 }
             }
+            AsyncMsg::Diff { title, content } => {
+                self.modal = Modal::Diff {
+                    title,
+                    lines: content.lines().map(str::to_owned).collect(),
+                    scroll: 0,
+                };
+            }
+        }
+    }
+
+    /// In solo mode only the focused group's session is attached.
+    pub fn visible_slots(&self) -> Vec<u8> {
+        if self.solo {
+            vec![self.active_slot()]
+        } else {
+            vec![self.active_a, self.active_b]
         }
     }
 
@@ -199,15 +229,20 @@ impl App {
         scored.into_iter().map(|(_, p)| p).collect()
     }
 
-    /// Make sure the sessions visible in both groups are attached, and
-    /// nothing else is. Returns ids that need a daemon-side resize.
+    /// Make sure the visible sessions (both groups, or just the focused
+    /// one in solo mode) are attached, and nothing else is.
     pub async fn sync_attachments(&mut self, pane_a: (u16, u16), pane_b: (u16, u16)) -> Result<()> {
         let mut want: Vec<(i64, (u16, u16))> = Vec::new();
-        if let Some(s) = self.session_in_slot(self.active_a) {
-            want.push((s.id, pane_a));
+        let visible = self.visible_slots();
+        if visible.contains(&self.active_a) {
+            if let Some(s) = self.session_in_slot(self.active_a) {
+                want.push((s.id, pane_a));
+            }
         }
-        if let Some(s) = self.session_in_slot(self.active_b) {
-            want.push((s.id, pane_b));
+        if visible.contains(&self.active_b) {
+            if let Some(s) = self.session_in_slot(self.active_b) {
+                want.push((s.id, pane_b));
+            }
         }
 
         let current: Vec<i64> = self.terms.keys().copied().collect();

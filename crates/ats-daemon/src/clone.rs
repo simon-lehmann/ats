@@ -121,14 +121,20 @@ impl CloneManager {
         name: &str,
         path: &str,
         setup_cmd: Option<&str>,
+        kickoff_prompt: Option<&str>,
     ) -> Result<TemplateInfo> {
         let p = Path::new(path);
         if !p.join(".git").exists() {
             bail!("{path} is not a git repository (no .git)");
         }
         let origin = git(p, &["remote", "get-url", "origin"]).await.ok();
-        self.store
-            .insert_template(name, path, origin.as_deref().map(str::trim), setup_cmd)
+        self.store.insert_template(
+            name,
+            path,
+            origin.as_deref().map(str::trim),
+            setup_cmd,
+            kickoff_prompt,
+        )
     }
 
     pub async fn spawn_workspace(&self, template_id: i64) -> Result<WorkspaceInfo> {
@@ -259,7 +265,7 @@ mod tests {
 
         let m = mgr(tmp.path());
         let t = m
-            .register_template("demo", &template_dir.to_string_lossy(), None)
+            .register_template("demo", &template_dir.to_string_lossy(), None, None)
             .await
             .unwrap();
         let ws = m.spawn_workspace(t.id).await.unwrap();
@@ -302,7 +308,7 @@ mod tests {
         let plain = tmp.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         assert!(m
-            .register_template("x", &plain.to_string_lossy(), None)
+            .register_template("x", &plain.to_string_lossy(), None, None)
             .await
             .is_err());
     }
@@ -314,7 +320,7 @@ mod tests {
         make_template_repo(&template_dir).await;
         let m = mgr(tmp.path());
         let t = m
-            .register_template("demo", &template_dir.to_string_lossy(), None)
+            .register_template("demo", &template_dir.to_string_lossy(), None, None)
             .await
             .unwrap();
         let ws = m.spawn_workspace(t.id).await.unwrap();

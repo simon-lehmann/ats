@@ -63,6 +63,7 @@ the data dir with `$ATS_DATA_DIR`.
 | `Alt+p` | prompt palette: type to filter, Enter paste |
 | `Alt+d` | one-line digest of the active session |
 | `Alt+o` | orchestrator: ask a question across all sessions |
+| `Alt+h` | harvest the active workspace → scrollable diff viewer |
 | `Alt+Esc` | raw mode (all keys to the PTY) |
 | `Alt+x` | detach UI — agents keep running |
 | `F1` | help |
@@ -75,13 +76,26 @@ and re-entry briefings (`ats reentry <n>` → drafted as a note). Short final
 reports are digested heuristically without an API call; `auto_digest` on
 finish is opt-in in `ats.toml` (calm by default).
 
+## Power features
+
+- **Kickoff presets**: `ats register <name> <path> --kickoff "..."` — every
+  new session in that template gets the prompt typed at it once the agent
+  has booted. Spawning with a `kickoff_note_id` sends that note instead.
+- **Second monitor**: `ats-tui --group b` runs a single-group, full-height
+  client against the same daemon. Any number of clients can attach.
+- **Per-template colors**: `[ui.template_colors] api-core = "cyan"` tints
+  that template's tabs (calm — inactive tabs only).
+- **Scripting hooks**: `ats wait <id> --state finished --timeout 600`
+  blocks until a session needs you; `ats events` streams state changes as
+  JSON lines (PTY noise filtered) — pipe it into anything.
+
 ## Status
 
-Phases 1–3 complete: daemon-owned PTY sessions, template→workspace clones,
-two-group TUI with live vt100 rendering, attach/detach with scrollback,
-transcript-based status (`!` needs input with the verbatim question, `●`
-finished with a summary line), notes (draft → finalize → send-to-session),
-prompt clipboard with fuzzy palette, git status in the rail, headless CLI,
-LLM orchestrator (digests, ask-across-sessions, re-entry notes).
-Remaining: Phase 4 polish (in-TUI diff viewer, kickoff presets, theming) —
-see [docs/PLAN.md §5](docs/PLAN.md).
+All four plan phases complete: daemon-owned PTY sessions, template→workspace
+clones, two-group TUI with live vt100 rendering, attach/detach with
+scrollback, transcript-based status (`!` needs input with the verbatim
+question, `●` finished with a summary line), notes, prompt clipboard,
+git status in the rail, LLM orchestrator (digests, ask-across-sessions,
+re-entry notes), in-TUI harvest diff viewer, kickoff presets, multi-client
+solo mode, per-template theming, CLI automation hooks.
+See [docs/PLAN.md](docs/PLAN.md) for the original design.

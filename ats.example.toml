@@ -16,6 +16,11 @@ rail_width = 28
 group_a_slots = 5
 group_b_slots = 5
 
+# calm per-template tab tinting (named colors or "#rrggbb")
+# [ui.template_colors]
+# api-core = "cyan"
+# web-app = "#87af87"
+
 # [keys]
 # spawn = "alt+s"
 # review_queue = "alt+q"

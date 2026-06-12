@@ -26,6 +26,9 @@ pub struct Daemon {
     pub sessions: SessionManager,
     pub clones: CloneManager,
     pub orchestrator: crate::orchestrator::Orchestrator,
+    /// interactive-orchestrator conversation (crate::agent); the lock also
+    /// serializes chat turns
+    pub orchestrator_history: Mutex<Vec<serde_json::Value>>,
     pub events: broadcast::Sender<Event>,
     pub config: Config,
 }
@@ -41,17 +44,26 @@ impl Daemon {
             data_dir,
         );
         let orchestrator = crate::orchestrator::Orchestrator::new(&config.orchestrator);
-        Self { store, sessions, clones, orchestrator, events, config }
+        Self {
+            store,
+            sessions,
+            clones,
+            orchestrator,
+            orchestrator_history: Mutex::new(Vec::new()),
+            events,
+            config,
+        }
     }
 
     /// Spawn workspace + session from a template; the full `Alt+s` flow.
-    /// A kickoff (note body, falling back to the template's preset) is
-    /// written to the agent's stdin once it has had a moment to boot.
-    async fn spawn_session(
+    /// Kickoff precedence: explicit override (orchestrator) > note body >
+    /// template preset — written to the agent's stdin once it has booted.
+    pub async fn spawn_session_with_kickoff(
         self: &Arc<Self>,
         template_id: i64,
         tab_slot: Option<u8>,
         kickoff_note_id: Option<i64>,
+        kickoff_override: Option<String>,
     ) -> Result<Response> {
         let template = self
             .store
@@ -77,9 +89,12 @@ impl Daemon {
         self.store
             .update_workspace(ws.id, None, None, ats_core::state::WorkspaceStatus::Attached)?;
 
-        let kickoff = match kickoff_note_id {
-            Some(note_id) => self.store.get_note(note_id)?.map(|n| (Some(note_id), n.body)),
-            None => template.kickoff_prompt.map(|p| (None, p)),
+        let kickoff = match (kickoff_override, kickoff_note_id) {
+            (Some(text), _) => Some((None, text)),
+            (None, Some(note_id)) => {
+                self.store.get_note(note_id)?.map(|n| (Some(note_id), n.body))
+            }
+            (None, None) => template.kickoff_prompt.map(|p| (None, p)),
         };
         if let Some((note_id, text)) = kickoff {
             let daemon = self.clone();
@@ -112,7 +127,8 @@ impl Daemon {
         match req {
             Request::ListSessions => Ok(Response::Sessions { sessions: self.store.list_sessions()? }),
             Request::SpawnSession { template_id, tab_slot, kickoff_note_id } => {
-                self.spawn_session(template_id, tab_slot, kickoff_note_id).await
+                self.spawn_session_with_kickoff(template_id, tab_slot, kickoff_note_id, None)
+                    .await
             }
             Request::AttachSession { session_id } => {
                 let data = self.sessions.attach(session_id)?;
@@ -259,6 +275,14 @@ impl Daemon {
             Request::DraftReentry { session_id } => {
                 let note = self.orchestrator.draft_reentry(&self.store, session_id).await?;
                 Ok(Response::Note { note })
+            }
+            Request::OrchestratorChat { message } => {
+                let text = crate::agent::chat(self, message).await?;
+                Ok(Response::Answer { text })
+            }
+            Request::OrchestratorReset => {
+                self.orchestrator_history.lock().await.clear();
+                Ok(Response::Ok)
             }
         }
     }

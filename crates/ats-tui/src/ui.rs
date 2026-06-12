@@ -63,8 +63,8 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
             draw_editor(frame, "note — Tab title/body, Ctrl+s save", title, body, *editing_body)
         }
         Modal::Palette { query, selected } => draw_palette(frame, app, query, *selected),
-        Modal::Orchestrator { question, answer, busy } => {
-            draw_orchestrator(frame, question, answer.as_deref(), *busy)
+        Modal::Orchestrator { input, log, busy } => {
+            draw_orchestrator(frame, input, log, *busy)
         }
         Modal::Diff { title, lines, scroll } => draw_diff(frame, title, lines, *scroll),
         Modal::PromptEdit { label, body, editing_body } => {
@@ -385,7 +385,7 @@ fn draw_help(frame: &mut Frame) {
         ("Alt+n", "notes: n new, e edit, f finalize, Enter send"),
         ("Alt+p", "prompt palette (type to filter, Enter paste)"),
         ("Alt+d", "digest the active session (one line)"),
-        ("Alt+o", "orchestrator: ask across all sessions"),
+        ("Alt+o", "orchestrator chat: it sets up, spawns, instructs"),
         ("Alt+h", "harvest active workspace → diff viewer"),
         ("Alt+Esc", "raw mode: forward all keys to the terminal"),
         ("Alt+x", "detach UI (daemon and agents keep running)"),
@@ -496,41 +496,61 @@ fn draw_palette(frame: &mut Frame, app: &App, query: &str, selected: usize) {
     );
 }
 
-fn draw_orchestrator(frame: &mut Frame, question: &str, answer: Option<&str>, busy: bool) {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("  ? ", DIM),
-            Span::styled(question.to_string(), ACTIVE),
-            Span::styled(if busy { "" } else { "▎" }, ACTIVE),
-        ]),
-        Line::styled("─".repeat(70), DIM),
-    ];
-    if busy {
-        lines.push(Line::styled("  thinking…", DIM));
-    } else if let Some(a) = answer {
-        for l in a.lines() {
-            // crude wrap at panel width
-            let mut rest = l;
+fn draw_orchestrator(frame: &mut Frame, input: &str, log: &[String], busy: bool) {
+    let area = frame.area();
+    let w = area.width.saturating_sub(8).min(100);
+    let h = area.height.saturating_sub(4).min(30);
+    let view = centered(frame, w, h);
+    let wrap_at = w.saturating_sub(4) as usize;
+
+    // wrap the log, newest lines win the available space
+    let mut wrapped: Vec<Line> = Vec::new();
+    for entry in log {
+        let style = if entry.starts_with("you: ") {
+            ACTIVE
+        } else if entry.starts_with('→') || entry.starts_with('←') {
+            DIM
+        } else if entry.starts_with("error") {
+            ALERT
+        } else {
+            NORMAL
+        };
+        for raw in entry.lines() {
+            let mut rest: Vec<char> = raw.chars().collect();
             loop {
-                let take = rest.chars().take(70).collect::<String>();
-                lines.push(Line::styled(format!("  {take}"), NORMAL));
-                if rest.chars().count() <= 70 {
+                let take: String = rest.iter().take(wrap_at).collect();
+                wrapped.push(Line::styled(format!("  {take}"), style));
+                if rest.len() <= wrap_at {
                     break;
                 }
-                rest = &rest[take.len()..];
+                rest = rest.split_off(wrap_at);
             }
         }
-    } else {
-        lines.push(Line::styled(
-            "  ask across all sessions, e.g. \"which sessions are blocked?\"",
-            DIM,
-        ));
     }
-    let area = centered(frame, 76, (lines.len() as u16 + 2).clamp(7, 28));
-    frame.render_widget(Clear, area);
+    let body = (h as usize).saturating_sub(4);
+    let mut lines: Vec<Line> = if log.is_empty() {
+        vec![
+            Line::styled("  tell the orchestrator what you want, e.g.:", DIM),
+            Line::styled("    register ~/repos/api-core as api-core", DIM),
+            Line::styled("    spawn 3 sessions and split the open notes between them", DIM),
+            Line::styled("    tell every working session to commit and report status", DIM),
+        ]
+    } else {
+        wrapped.split_off(wrapped.len().saturating_sub(body))
+    };
+    lines.push(Line::styled("─".repeat(wrap_at + 2), DIM));
+    lines.push(Line::from(vec![
+        Span::styled(if busy { "  ⋯ " } else { "  ❯ " }, DIM),
+        Span::styled(input.to_string(), ACTIVE),
+        Span::styled(if busy { "" } else { "▎" }, ACTIVE),
+    ]));
+
+    frame.render_widget(Clear, view);
     frame.render_widget(
-        Paragraph::new(lines).block(modal_block("orchestrator — Enter to ask")),
-        area,
+        Paragraph::new(lines).block(modal_block(
+            "orchestrator — Enter send · Ctrl+r reset · Esc close (chat persists)",
+        )),
+        view,
     );
 }
 

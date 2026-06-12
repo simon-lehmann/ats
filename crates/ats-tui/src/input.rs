@@ -169,8 +169,8 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
             KeyCode::Char('o') => {
                 app.modal = Modal::Orchestrator {
-                    question: String::new(),
-                    answer: None,
+                    input: String::new(),
+                    log: Vec::new(),
                     busy: false,
                 };
                 return Ok(());
@@ -421,15 +421,21 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 _ => app.modal = Modal::Diff { title, lines, scroll },
             }
         }
-        Modal::Orchestrator { mut question, answer, busy } => {
+        Modal::Orchestrator { mut input, mut log, busy } => {
             if key.code == KeyCode::Esc {
-            } else if key.code == KeyCode::Enter && !busy && !question.trim().is_empty() {
+                // close; daemon keeps the conversation — Alt+o resumes it
+            } else if is_ctrl(&key, 'r') && !busy {
+                app.client.request(Request::OrchestratorReset).await?;
+                log.push("— conversation reset —".into());
+                app.modal = Modal::Orchestrator { input, log, busy };
+            } else if key.code == KeyCode::Enter && !busy && !input.trim().is_empty() {
+                let message = std::mem::take(&mut input);
+                log.push(format!("you: {message}"));
                 let client = app.client.clone();
                 let tx = app.async_tx.clone();
-                let q = question.clone();
                 tokio::spawn(async move {
                     let result = match client
-                        .request(Request::AskOrchestrator { question: q, session_ids: vec![] })
+                        .request(Request::OrchestratorChat { message })
                         .await
                     {
                         Ok(ats_core::rpc::Response::Answer { text }) => Ok(text),
@@ -438,12 +444,12 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     };
                     let _ = tx.send(crate::app::AsyncMsg::Answer(result));
                 });
-                app.modal = Modal::Orchestrator { question, answer: None, busy: true };
-            } else if !busy {
-                edit_text(&mut question, &key);
-                app.modal = Modal::Orchestrator { question, answer, busy };
+                app.modal = Modal::Orchestrator { input, log, busy: true };
             } else {
-                app.modal = Modal::Orchestrator { question, answer, busy };
+                if !busy {
+                    edit_text(&mut input, &key);
+                }
+                app.modal = Modal::Orchestrator { input, log, busy };
             }
         }
         Modal::PromptEdit { mut label, mut body, editing_body } => {

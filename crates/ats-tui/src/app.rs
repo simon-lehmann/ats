@@ -35,10 +35,11 @@ pub enum Modal {
     },
     /// fuzzy prompt palette for Alt+p
     Palette { query: String, selected: usize },
-    /// orchestrator ask panel for Alt+o
+    /// interactive orchestrator chat for Alt+o
     Orchestrator {
-        question: String,
-        answer: Option<String>,
+        input: String,
+        /// chat + tool-progress lines ("you: …", "orch: …", "→ tool …")
+        log: Vec<String>,
         busy: bool,
     },
     /// harvest diff viewer for Alt+h
@@ -134,12 +135,13 @@ impl App {
         match msg {
             AsyncMsg::Status(s) => self.status_line = s,
             AsyncMsg::Answer(result) => {
-                if let Modal::Orchestrator { answer, busy, .. } = &mut self.modal {
+                if let Modal::Orchestrator { log, busy, .. } = &mut self.modal {
                     *busy = false;
-                    *answer = Some(match result {
-                        Ok(a) => a,
-                        Err(e) => format!("error: {e}"),
-                    });
+                    match result {
+                        // the final text already arrived as a progress line
+                        Ok(_) => {}
+                        Err(e) => log.push(format!("error: {e}")),
+                    }
                 }
             }
             AsyncMsg::Diff { title, content } => {
@@ -149,6 +151,15 @@ impl App {
                     scroll: 0,
                 };
             }
+        }
+    }
+
+    /// Live tool-call progress from the daemon's orchestrator agent.
+    pub fn push_orchestrator_progress(&mut self, text: String) {
+        if let Modal::Orchestrator { log, .. } = &mut self.modal {
+            log.push(text);
+        } else {
+            self.status_line = format!("orch: {text}");
         }
     }
 

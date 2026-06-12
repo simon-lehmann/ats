@@ -97,16 +97,22 @@ impl SessionManager {
             })
             .map_err(|e| anyhow!("openpty: {e}"))?;
 
+        // Run the agent inside a shell that stays alive after it exits, so the
+        // pane is a real terminal ("ultimate freedom"): `/exit`-ing Claude Code
+        // drops to a shell prompt instead of killing the session. The session
+        // ends only when the shell itself exits (or it's killed).
         #[cfg(unix)]
         let mut builder = {
             let mut b = CommandBuilder::new("sh");
-            b.args(["-c", cmd]);
+            let script = format!("{cmd}; exec \"${{SHELL:-sh}}\" -i");
+            b.args(["-c", &script]);
             b
         };
         #[cfg(windows)]
         let mut builder = {
             let mut b = CommandBuilder::new("pwsh");
-            b.args(["-NoProfile", "-Command", cmd]);
+            // -NoExit keeps pwsh at an interactive prompt after the agent exits
+            b.args(["-NoProfile", "-NoExit", "-Command", cmd]);
             b
         };
         builder.cwd(cwd);
@@ -321,7 +327,9 @@ mod tests {
         let tx = bus();
         let mut rx = tx.subscribe();
         let mgr = SessionManager::new(tx, 1000);
-        mgr.spawn(sid, "sh -c 'echo hello-ats; sleep 0.1'", "/tmp", store.clone())
+        // `exit` ends the wrapping shell so the session dies (agents that just
+        // finish now drop to a shell instead — see spawn's "ultimate freedom")
+        mgr.spawn(sid, "echo hello-ats; sleep 0.1; exit", "/tmp", store.clone())
             .unwrap();
         // attach so output is broadcast
         mgr.attach(sid).unwrap();

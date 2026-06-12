@@ -47,9 +47,10 @@ async fn full_spawn_flow_over_socket() {
     let mut config = Config::default();
     config.daemon.workspaces_root =
         tmp.path().join("workspaces").to_string_lossy().into_owned();
-    // fake agent: prints, waits, prints, exits
+    // fake agent: prints, waits, prints, then `exit` ends the wrapping shell
+    // (agents that merely finish now drop to a shell — "ultimate freedom")
     config.daemon.session_cmd =
-        "sh -c 'echo agent-booted; sleep 0.3; echo agent-finished'".into();
+        "echo agent-booted; sleep 0.3; echo agent-finished; exit".into();
     config.daemon.idle_threshold_secs = 1;
 
     let store = Arc::new(Store::open(&tmp.path().join("ats.db")).unwrap());
@@ -713,5 +714,74 @@ async fn orchestrator_is_singleton_no_tab_and_attachable() {
     assert!(setup_cmd.exists(), "/setup-repo command was not written");
 
     let _ = client.request(Request::KillSession { session_id: s1.id }).await;
+    server_handle.abort();
+}
+
+/// "Ultimate freedom": when the agent exits, the pane survives as a live shell
+/// (you don't lose the terminal by `/exit`-ing Claude Code). Cross-platform.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_exit_drops_to_a_live_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_str = test_socket("shell");
+
+    let mut config = Config::default();
+    config.daemon.workspaces_root =
+        tmp.path().join("workspaces").to_string_lossy().into_owned();
+    // an agent that prints once and exits immediately
+    config.daemon.session_cmd =
+        if cfg!(windows) { "Write-Output AGENT-RAN".into() } else { "echo AGENT-RAN".into() };
+    config.orchestrator.mcp_enabled = false;
+
+    let store = Arc::new(Store::open(&tmp.path().join("ats.db")).unwrap());
+    let daemon = Arc::new(server::Daemon::new(config, store, tmp.path().join("data")));
+    let server_handle = tokio::spawn({
+        let daemon = daemon.clone();
+        let s = socket_str.clone();
+        async move { server::serve(daemon, &s).await }
+    });
+    let client = connect_retry(&socket_str).await;
+
+    let Response::Session { session } = client
+        .request(Request::SpawnScratchSession { cwd: None, tab_slot: None, kickoff: None })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a session")
+    };
+    let sid = session.id;
+
+    // the agent prints and exits; the pane must NOT die — a shell takes over
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let Response::Sessions { sessions } = client.request(Request::ListSessions).await.unwrap()
+    else {
+        panic!()
+    };
+    let state = sessions.iter().find(|s| s.id == sid).unwrap().state;
+    assert_ne!(state, SessionState::Dead, "pane should survive the agent exiting");
+
+    // the surviving shell is interactive: a typed command runs
+    let cmd: Vec<u8> = if cfg!(windows) {
+        b"Write-Output SHELL-ALIVE\r".to_vec()
+    } else {
+        b"echo SHELL-ALIVE\n".to_vec()
+    };
+    client.request(Request::WriteStdin { session_id: sid, bytes: cmd }).await.unwrap();
+
+    let mut alive = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        if let Response::Scrollback { data, .. } =
+            client.request(Request::GetScrollback { session_id: sid }).await.unwrap()
+        {
+            if String::from_utf8_lossy(&data).contains("SHELL-ALIVE") {
+                alive = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(alive, "the shell didn't run a typed command after the agent exited");
+
+    let _ = client.request(Request::KillSession { session_id: sid }).await;
     server_handle.abort();
 }

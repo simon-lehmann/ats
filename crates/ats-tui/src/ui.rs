@@ -143,11 +143,11 @@ fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                     ("F1", "help"),
                 ],
                 _ => vec![
+                    ("Alt+←/→", "tab"),
                     ("Alt+s", "spawn"),
                     ("Alt+o", "orchestrator"),
                     ("Alt+q", "queue"),
                     ("Alt+n", "notes"),
-                    ("Alt+1-0", "tab"),
                     ("Alt+x", "detach"),
                     ("F1", "help"),
                 ],
@@ -478,6 +478,7 @@ fn modal_block(title: &str) -> Block<'_> {
 fn draw_help(frame: &mut Frame) {
     let lines: Vec<Line> = [
         ("Alt+1..5 / Alt+6..0", "jump to tab in group A / B"),
+        ("Alt+←/→", "previous / next tab"),
         ("Alt+` ", "toggle focus group A ↔ B"),
         ("Alt+r", "focus rail"),
         ("Alt+s", "spawn: template → workspace → session"),

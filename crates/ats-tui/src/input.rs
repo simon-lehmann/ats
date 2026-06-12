@@ -116,6 +116,15 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 };
                 return Ok(());
             }
+            // Alt+←/→ cycle through occupied tabs across both groups
+            KeyCode::Right => {
+                focus_tab(app, 1);
+                return Ok(());
+            }
+            KeyCode::Left => {
+                focus_tab(app, -1);
+                return Ok(());
+            }
             KeyCode::Char('r') => {
                 app.focus = Focus::Rail;
                 return Ok(());
@@ -497,6 +506,23 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Move focus to the next (`delta = 1`) or previous (`delta = -1`) occupied
+/// tab, in slot order across both groups, wrapping around. No-op if nothing
+/// is running. From an empty slot, lands on the first/last occupied tab.
+fn focus_tab(app: &mut App, delta: i32) {
+    let total = app.a_slots + app.b_slots;
+    let occupied: Vec<u8> = (1..=total).filter(|s| app.session_in_slot(*s).is_some()).collect();
+    if occupied.is_empty() {
+        return;
+    }
+    let next = match occupied.iter().position(|&s| s == app.active_slot()) {
+        Some(i) => occupied[(i as i32 + delta).rem_euclid(occupied.len() as i32) as usize],
+        None if delta >= 0 => occupied[0],
+        None => occupied[occupied.len() - 1],
+    };
+    jump_to_slot(app, next);
 }
 
 fn jump_to_slot(app: &mut App, slot: u8) {

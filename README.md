@@ -104,6 +104,7 @@ ats scratch --kickoff "review the open PRs and summarize"
 | Key | Action |
 |---|---|
 | `Alt+1..5` / `Alt+6..0` | jump to tab in group A / B |
+| `Alt+←` / `Alt+→` | previous / next tab (cycles occupied tabs) |
 | `` Alt+` `` | toggle focus group A ↔ B |
 | `Alt+s` | spawn: template → workspace → session (`p` = planning session) |
 | `Alt+q` | review queue — what needs you, with the question verbatim |

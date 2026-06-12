@@ -79,6 +79,15 @@ enum Cmd {
     },
     /// Draft a re-entry briefing note for a session
     Reentry { session_id: i64 },
+    /// Talk to the interactive orchestrator: it registers templates,
+    /// spawns sessions, instructs and reads them on your behalf
+    Orch {
+        /// instruction; omit with --reset to just clear the conversation
+        message: Option<String>,
+        /// clear the orchestrator's conversation history first
+        #[arg(long)]
+        reset: bool,
+    },
     /// Notes / plans
     #[command(subcommand)]
     Note(NoteCmd),
@@ -349,6 +358,29 @@ async fn main() -> Result<()> {
             let resp = client.request(Request::DraftReentry { session_id }).await?;
             if let Response::Note { note } = resp {
                 println!("note {} — {}\n\n{}", note.id, note.title, note.body);
+            }
+        }
+        Cmd::Orch { message, reset } => {
+            if reset {
+                client.request(Request::OrchestratorReset).await?;
+                println!("conversation reset");
+            }
+            if let Some(message) = message {
+                // stream tool-call progress while the agent works
+                let mut events = client.subscribe_events();
+                let printer = tokio::spawn(async move {
+                    while let Ok(ev) = events.recv().await {
+                        if let ats_core::rpc::Event::OrchestratorProgress { text } = ev {
+                            eprintln!("  {text}");
+                        }
+                    }
+                });
+                let resp = client.request(Request::OrchestratorChat { message }).await;
+                printer.abort();
+                match resp? {
+                    Response::Answer { text } => println!("{text}"),
+                    other => bail!("unexpected response: {other:?}"),
+                }
             }
         }
         Cmd::Note(cmd) => match cmd {

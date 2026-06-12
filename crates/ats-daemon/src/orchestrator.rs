@@ -38,7 +38,8 @@ impl Orchestrator {
         }
     }
 
-    async fn complete(&self, system: &str, user: &str) -> Result<String> {
+    /// Raw /v1/messages call; returns the full response body.
+    async fn messages(&self, payload: Value) -> Result<Value> {
         let key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| anyhow!("ANTHROPIC_API_KEY not set — orchestrator features need it"))?;
         let resp = self
@@ -46,12 +47,7 @@ impl Orchestrator {
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01")
-            .json(&json!({
-                "model": self.model,
-                "max_tokens": 1024,
-                "system": system,
-                "messages": [{"role": "user", "content": user}],
-            }))
+            .json(&payload)
             .send()
             .await?;
         let status = resp.status();
@@ -62,6 +58,35 @@ impl Orchestrator {
                 body.pointer("/error/message").and_then(Value::as_str).unwrap_or("?")
             );
         }
+        Ok(body)
+    }
+
+    /// Tool-enabled call for the interactive agent loop (crate::agent).
+    pub(crate) async fn messages_payload(
+        &self,
+        history: &[Value],
+        tools: &Value,
+        system: &str,
+    ) -> Result<Value> {
+        self.messages(json!({
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": system,
+            "tools": tools,
+            "messages": history,
+        }))
+        .await
+    }
+
+    async fn complete(&self, system: &str, user: &str) -> Result<String> {
+        let body = self
+            .messages(json!({
+                "model": self.model,
+                "max_tokens": 1024,
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
+            }))
+            .await?;
         body.pointer("/content/0/text")
             .and_then(Value::as_str)
             .map(|s| s.trim().to_string())

@@ -70,11 +70,28 @@ the data dir with `$ATS_DATA_DIR`.
 
 ## Orchestrator
 
-Set `ANTHROPIC_API_KEY` to enable digests (`Alt+d` / `ats digest <n>`),
-cross-session questions (`Alt+o` / `ats ask "which sessions are blocked?"`),
-and re-entry briefings (`ats reentry <n>` → drafted as a note). Short final
-reports are digested heuristically without an API call; `auto_digest` on
-finish is opt-in in `ats.toml` (calm by default).
+Set `ANTHROPIC_API_KEY` to enable the orchestrator. `Alt+o` (or
+`ats orch "..."`) opens an **interactive chat with tools**: the orchestrator
+can register templates, spawn sessions, type instructions into any or all
+sessions, read what they're doing, and harvest results. Setup and
+fleet-wide workflows are one instruction away:
+
+```
+❯ register ~/repos/api-core as api-core, spawn 3 sessions,
+  and have each one pick a different module from docs/TODO.md
+❯ tell every working session to commit, push, and post a one-line status
+❯ which sessions are blocked, and on what?
+```
+
+Tool calls stream live into the panel (`→ spawn_session {...}`); the
+conversation persists in the daemon across panel closes and clients
+(`Ctrl+r` / `ats orch --reset` clears it). Each instruction is capped at
+12 tool rounds.
+
+Also available: one-line digests (`Alt+d` / `ats digest <n>` — heuristic
+for short reports, no API call), one-shot questions (`ats ask`), and
+re-entry briefings (`ats reentry <n>` → drafted as a note). `auto_digest`
+on finish is opt-in in `ats.toml` (calm by default).
 
 ## Power features
 

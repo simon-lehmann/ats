@@ -246,8 +246,8 @@ mod tests {
 
     #[test]
     fn project_dir_encoding_matches_claude_code() {
-        let d = project_dir_for_cwd(Path::new("/home/u/.claude"), "/home/simon/remotedev/repo");
-        assert!(d.ends_with("projects/-home-simon-remotedev-repo"), "{d:?}");
+        let d = project_dir_for_cwd(Path::new("/home/u/.claude"), "/home/dev/projects/repo");
+        assert!(d.ends_with("projects/-home-dev-projects-repo"), "{d:?}");
     }
 
     #[test]

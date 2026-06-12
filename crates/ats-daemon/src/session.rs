@@ -308,6 +308,7 @@ mod tests {
         assert!(ring.snapshot().ends_with(b"0123456789"));
     }
 
+    #[cfg_attr(windows, ignore = "Unix `sh`/`echo` fake agent; pwsh port tracked")]
     #[tokio::test(flavor = "multi_thread")]
     async fn spawn_echo_collect_output_then_dead() {
         let store = Arc::new(Store::open_in_memory().unwrap());
@@ -357,6 +358,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(windows, ignore = "Unix `cat` stdin-echo fake agent; pwsh port tracked")]
     #[tokio::test(flavor = "multi_thread")]
     async fn stdin_reaches_process() {
         let store = Arc::new(Store::open_in_memory().unwrap());

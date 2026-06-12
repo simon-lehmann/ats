@@ -200,6 +200,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     // Layout snapshot (plan §6): rail sections and both tab groups render.
+    #[cfg_attr(windows, ignore = "spins a daemon over a filesystem-socket path invalid on Windows")]
     #[tokio::test]
     async fn layout_renders_rail_and_groups() {
         // a client that never connects isn't needed for pure rendering;

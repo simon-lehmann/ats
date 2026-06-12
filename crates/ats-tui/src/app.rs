@@ -165,9 +165,9 @@ impl App {
         self.session_in_slot(self.active_slot()).map(|s| s.id)
     }
 
-    /// The orchestrator session (no tab slot; shown in the Alt+o overlay).
+    /// The live orchestrator session (no tab slot; shown in the Alt+o overlay).
     pub fn orchestrator_session_id(&self) -> Option<i64> {
-        self.sessions.iter().find(|s| s.is_orchestrator).map(|s| s.id)
+        newest_live_orchestrator(&self.sessions)
     }
 
     pub fn review_queue(&self) -> Vec<&SessionInfo> {
@@ -303,6 +303,17 @@ impl App {
     }
 }
 
+/// Newest non-dead orchestrator session id. `sessions` may include dead rows,
+/// and the orchestrator flag repeats across respawns, so filter by liveness and
+/// take the most recent — a bare `find` on the flag could pick a dead session.
+pub fn newest_live_orchestrator(sessions: &[SessionInfo]) -> Option<i64> {
+    sessions
+        .iter()
+        .filter(|s| s.is_orchestrator && s.state != SessionState::Dead)
+        .max_by_key(|s| s.id)
+        .map(|s| s.id)
+}
+
 pub fn state_glyph(state: SessionState) -> &'static str {
     match state {
         SessionState::Working => "·",
@@ -337,7 +348,49 @@ pub fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::fuzzy_score;
+    use super::{fuzzy_score, newest_live_orchestrator};
+    use ats_core::rpc::SessionInfo;
+    use ats_core::state::SessionState;
+
+    fn session(id: i64, is_orchestrator: bool, state: SessionState) -> SessionInfo {
+        SessionInfo {
+            id,
+            workspace_id: 1,
+            tab_slot: None,
+            pid: None,
+            title: "orchestrator".into(),
+            template_name: "scratch".into(),
+            state,
+            state_detail: None,
+            workspace_path: "/x".into(),
+            created_at: 0,
+            last_activity_at: 0,
+            is_orchestrator,
+        }
+    }
+
+    #[test]
+    fn newest_live_orchestrator_skips_dead_respawns() {
+        // dead orchestrators 2 & 3 from earlier respawns, live one is 4
+        let sessions = vec![
+            session(2, true, SessionState::Dead),
+            session(3, true, SessionState::Dead),
+            session(4, true, SessionState::Idle),
+            session(5, false, SessionState::Working),
+        ];
+        assert_eq!(newest_live_orchestrator(&sessions), Some(4));
+
+        // no live orchestrator → None (so EnsureOrchestrator can respawn)
+        assert_eq!(
+            newest_live_orchestrator(&[session(2, true, SessionState::Dead)]),
+            None
+        );
+        // never an orchestrator → None
+        assert_eq!(
+            newest_live_orchestrator(&[session(1, false, SessionState::Working)]),
+            None
+        );
+    }
 
     #[test]
     fn fuzzy_matches_subsequences_and_ranks_consecutive_higher() {

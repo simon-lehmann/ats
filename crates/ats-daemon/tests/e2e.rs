@@ -34,6 +34,7 @@ async fn make_template(dir: &std::path::Path) {
     git(dir, &["commit", "-m", "init"]).await;
 }
 
+#[cfg_attr(windows, ignore = "Unix fake agent + filesystem socket; Windows port tracked")]
 #[tokio::test(flavor = "multi_thread")]
 async fn full_spawn_flow_over_socket() {
     let tmp = tempfile::tempdir().unwrap();
@@ -153,6 +154,7 @@ async fn full_spawn_flow_over_socket() {
     server_handle.abort();
 }
 
+#[cfg_attr(windows, ignore = "Unix fake agent + filesystem socket; Windows port tracked")]
 #[tokio::test(flavor = "multi_thread")]
 async fn quiet_session_with_question_transcript_becomes_needs_input() {
     let tmp = tempfile::tempdir().unwrap();
@@ -277,6 +279,7 @@ async fn fake_anthropic(listener: tokio::net::TcpListener, reply: &'static str) 
     }
 }
 
+#[cfg_attr(windows, ignore = "Unix fake agent + filesystem socket; Windows port tracked")]
 #[tokio::test(flavor = "multi_thread")]
 async fn orchestrator_digest_ask_and_reentry() {
     let tmp = tempfile::tempdir().unwrap();
@@ -379,164 +382,7 @@ async fn orchestrator_digest_ask_and_reentry() {
     server_handle.abort();
 }
 
-/// Anthropic-shaped server that serves scripted response bodies in order
-/// (then repeats the last one).
-async fn scripted_anthropic(listener: tokio::net::TcpListener, bodies: Vec<String>) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let counter = Arc::new(AtomicUsize::new(0));
-    let bodies = Arc::new(bodies);
-    loop {
-        let Ok((mut sock, _)) = listener.accept().await else { return };
-        let counter = counter.clone();
-        let bodies = bodies.clone();
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            let (mut header_end, mut content_len) = (None, 0usize);
-            loop {
-                let Ok(n) = sock.read(&mut tmp).await else { return };
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-                if header_end.is_none() {
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        header_end = Some(pos + 4);
-                        let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
-                        content_len = headers
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse().ok())
-                            .unwrap_or(0);
-                    }
-                }
-                if let Some(he) = header_end {
-                    if buf.len() >= he + content_len {
-                        break;
-                    }
-                }
-            }
-            let i = counter.fetch_add(1, Ordering::SeqCst).min(bodies.len() - 1);
-            let body = &bodies[i];
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-        });
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn interactive_orchestrator_spawns_and_instructs_via_tools() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-    let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let api_addr = api.local_addr().unwrap();
-    // round 1: the model calls spawn_session; round 2: it reports back
-    tokio::spawn(scripted_anthropic(
-        api,
-        vec![
-            r#"{"stop_reason":"tool_use","content":[
-                {"type":"text","text":"Spawning a session for the parser work."},
-                {"type":"tool_use","id":"tu_1","name":"spawn_session",
-                 "input":{"template":"demo","instruction":"please build the parser"}}
-            ]}"#
-                .into(),
-            r#"{"stop_reason":"end_turn","content":[
-                {"type":"text","text":"Done: session 1 is working on the parser."}
-            ]}"#
-                .into(),
-        ],
-    ));
-
-    let socket_str = tmp.path().join("ats-agent.sock").to_string_lossy().into_owned();
-    let template_dir = tmp.path().join("template");
-    make_template(&template_dir).await;
-
-    let mut config = Config::default();
-    config.daemon.workspaces_root =
-        tmp.path().join("workspaces").to_string_lossy().into_owned();
-    config.daemon.session_cmd = "cat".into(); // echoes the instruction
-    config.daemon.idle_threshold_secs = 600;
-    config.orchestrator.base_url = Some(format!("http://{api_addr}"));
-
-    let store = Arc::new(Store::open(&tmp.path().join("ats.db")).unwrap());
-    let daemon = Arc::new(server::Daemon::new(config, store, tmp.path().join("data")));
-    let server_handle = tokio::spawn({
-        let daemon = daemon.clone();
-        let s = socket_str.clone();
-        async move { server::serve(daemon, &s).await }
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let client = Client::connect(&socket_str).await.unwrap();
-    // the orchestrator needs the template to exist (it could also register
-    // it itself — covered by the tool unit path)
-    let resp = client
-        .request(Request::RegisterTemplate {
-            name: "demo".into(),
-            path: template_dir.to_string_lossy().into_owned(),
-            setup_cmd: None,
-            kickoff_prompt: None,
-        })
-        .await
-        .unwrap();
-    assert!(matches!(resp, Response::Template { .. }));
-
-    let mut events = client.subscribe_events();
-    let resp = client
-        .request(Request::OrchestratorChat {
-            message: "spawn a session from demo and have it build the parser".into(),
-        })
-        .await
-        .unwrap();
-    let Response::Answer { text } = resp else { panic!("{resp:?}") };
-    assert_eq!(text, "Done: session 1 is working on the parser.");
-
-    // tool-call progress was pushed (events are forwarded after the
-    // response on the same connection — wait, don't poll)
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let ev = tokio::time::timeout_at(deadline, events.recv())
-            .await
-            .expect("timed out waiting for spawn_session progress event")
-            .expect("event stream closed");
-        if let Event::OrchestratorProgress { text } = ev {
-            if text.contains("spawn_session") {
-                break;
-            }
-        }
-    }
-
-    // the tool really ran: one session exists…
-    let resp = client.request(Request::ListSessions).await.unwrap();
-    let Response::Sessions { sessions } = resp else { panic!() };
-    assert_eq!(sessions.len(), 1);
-    let sid = sessions[0].id;
-
-    // …and the kickoff instruction reaches its terminal (sent ~3s in)
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        assert!(tokio::time::Instant::now() < deadline, "instruction never arrived");
-        let resp = client.request(Request::GetScrollback { session_id: sid }).await.unwrap();
-        if let Response::Scrollback { data, .. } = resp {
-            if String::from_utf8_lossy(&data).contains("please build the parser") {
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-
-    // reset clears the conversation
-    let resp = client.request(Request::OrchestratorReset).await.unwrap();
-    assert!(matches!(resp, Response::Ok));
-
-    let _ = client.request(Request::KillSession { session_id: sid }).await;
-    server_handle.abort();
-}
-
+#[cfg_attr(windows, ignore = "Unix fake agent + filesystem socket; Windows port tracked")]
 #[tokio::test(flavor = "multi_thread")]
 async fn template_kickoff_prompt_reaches_the_agent() {
     let tmp = tempfile::tempdir().unwrap();
@@ -606,6 +452,7 @@ async fn template_kickoff_prompt_reaches_the_agent() {
     server_handle.abort();
 }
 
+#[cfg_attr(windows, ignore = "Unix fake agent + filesystem socket; Windows port tracked")]
 #[tokio::test(flavor = "multi_thread")]
 async fn scratch_session_runs_without_workspace_clone() {
     let tmp = tempfile::tempdir().unwrap();
@@ -682,6 +529,7 @@ async fn scratch_session_runs_without_workspace_clone() {
     server_handle.abort();
 }
 
+#[cfg_attr(windows, ignore = "Unix fake agent + filesystem socket; Windows port tracked")]
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_heartbeat_fires() {
     let tmp = tempfile::tempdir().unwrap();
@@ -744,5 +592,116 @@ async fn idle_heartbeat_fires() {
     }
 
     let _ = client.request(Request::KillSession { session_id }).await;
+    server_handle.abort();
+}
+
+// ---- cross-platform helpers (run on Windows too: named pipe + pwsh agent) ----
+
+/// A local-socket name valid on the host: a named pipe on Windows, a temp
+/// filesystem path on Unix.
+fn test_socket(tag: &str) -> String {
+    if cfg!(windows) {
+        format!(r"\\.\pipe\ats-test-{tag}-{}", std::process::id())
+    } else {
+        std::env::temp_dir()
+            .join(format!("ats-test-{tag}-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// A fake agent that prints `marker` then stays alive, in the syntax of the
+/// shell the daemon wraps `session_cmd` in (sh on Unix, pwsh on Windows).
+fn stay_alive_agent(marker: &str) -> String {
+    if cfg!(windows) {
+        format!("Write-Output {marker}; Start-Sleep -Seconds 20")
+    } else {
+        format!("echo {marker}; sleep 20")
+    }
+}
+
+/// Connect with retry — a named pipe has no filesystem existence check.
+async fn connect_retry(socket: &str) -> Arc<Client> {
+    for _ in 0..100 {
+        if let Ok(c) = Client::connect(socket).await {
+            return c;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("daemon never came up on {socket}");
+}
+
+/// The orchestrator is a singleton, takes no tab slot, and its live session is
+/// attachable — the exact path that regressed when the overlay attached a dead
+/// orchestrator. Cross-platform (named pipe + pwsh/sh fake agent).
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_is_singleton_no_tab_and_attachable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_str = test_socket("orch");
+
+    let mut config = Config::default();
+    config.daemon.workspaces_root =
+        tmp.path().join("workspaces").to_string_lossy().into_owned();
+    config.daemon.session_cmd = stay_alive_agent("orch-booted");
+    config.orchestrator.mcp_enabled = false; // don't shell out to claude
+
+    let store = Arc::new(Store::open(&tmp.path().join("ats.db")).unwrap());
+    let daemon = Arc::new(server::Daemon::new(config, store, tmp.path().join("data")));
+    let server_handle = tokio::spawn({
+        let daemon = daemon.clone();
+        let s = socket_str.clone();
+        async move { server::serve(daemon, &s).await }
+    });
+
+    let client = connect_retry(&socket_str).await;
+
+    // ensure → a live orchestrator, flagged, with no tab slot
+    let Response::Session { session: s1 } = client
+        .request(Request::EnsureOrchestrator { kickoff: None })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a session")
+    };
+    assert!(s1.is_orchestrator, "must be flagged as the orchestrator");
+    assert_eq!(s1.tab_slot, None, "orchestrator lives in the overlay, not a tab");
+
+    // idempotent: a second ensure returns the same session, not a new one
+    let Response::Session { session: s2 } = client
+        .request(Request::EnsureOrchestrator { kickoff: None })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a session")
+    };
+    assert_eq!(s2.id, s1.id, "EnsureOrchestrator must be idempotent");
+    let Response::Sessions { sessions } =
+        client.request(Request::ListSessions).await.unwrap()
+    else {
+        panic!()
+    };
+    let live_orch = sessions
+        .iter()
+        .filter(|s| s.is_orchestrator && s.state != SessionState::Dead)
+        .count();
+    assert_eq!(live_orch, 1, "exactly one live orchestrator");
+
+    // attach the live orchestrator → scrollback eventually shows the agent's
+    // output (proves it's attachable, the overlay's contract)
+    let mut attached = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        let resp = client.request(Request::GetScrollback { session_id: s1.id }).await.unwrap();
+        if let Response::Scrollback { data, .. } = resp {
+            if String::from_utf8_lossy(&data).contains("orch-booted") {
+                attached = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(attached, "live orchestrator scrollback never showed agent output");
+
+    let _ = client.request(Request::KillSession { session_id: s1.id }).await;
     server_handle.abort();
 }

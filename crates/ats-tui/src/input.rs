@@ -514,15 +514,23 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
 fn focus_tab(app: &mut App, delta: i32) {
     let total = app.a_slots + app.b_slots;
     let occupied: Vec<u8> = (1..=total).filter(|s| app.session_in_slot(*s).is_some()).collect();
-    if occupied.is_empty() {
-        return;
+    if let Some(next) = step_occupied(&occupied, app.active_slot(), delta) {
+        jump_to_slot(app, next);
     }
-    let next = match occupied.iter().position(|&s| s == app.active_slot()) {
+}
+
+/// The next occupied slot from `current` in `delta` direction, wrapping. If
+/// `current` isn't occupied, return the first (forward) or last (back). None
+/// when nothing is occupied.
+fn step_occupied(occupied: &[u8], current: u8, delta: i32) -> Option<u8> {
+    if occupied.is_empty() {
+        return None;
+    }
+    Some(match occupied.iter().position(|&s| s == current) {
         Some(i) => occupied[(i as i32 + delta).rem_euclid(occupied.len() as i32) as usize],
         None if delta >= 0 => occupied[0],
         None => occupied[occupied.len() - 1],
-    };
-    jump_to_slot(app, next);
+    })
 }
 
 fn jump_to_slot(app: &mut App, slot: u8) {
@@ -547,4 +555,21 @@ async fn forward(app: &mut App, key: &KeyEvent) -> Result<()> {
         .request(Request::WriteStdin { session_id, bytes })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::step_occupied;
+
+    #[test]
+    fn step_occupied_cycles_wraps_and_handles_empty_slots() {
+        let occ = [1u8, 3, 7];
+        assert_eq!(step_occupied(&occ, 1, 1), Some(3)); // next
+        assert_eq!(step_occupied(&occ, 7, 1), Some(1)); // wrap forward
+        assert_eq!(step_occupied(&occ, 1, -1), Some(7)); // wrap back
+        assert_eq!(step_occupied(&occ, 3, -1), Some(1)); // prev
+        assert_eq!(step_occupied(&occ, 5, 1), Some(1)); // from empty slot → first
+        assert_eq!(step_occupied(&occ, 5, -1), Some(7)); // from empty slot → last
+        assert_eq!(step_occupied(&[], 1, 1), None); // nothing running
+    }
 }

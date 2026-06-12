@@ -543,6 +543,38 @@ fn jump_to_slot(app: &mut App, slot: u8) {
     }
 }
 
+/// Forward pasted/drag-dropped text to the focused session as a *bracketed
+/// paste* (ESC[200~ … ESC[201~). Without this framing the agent's input parser
+/// treats the text as keystrokes and mangles it — e.g. a Windows path like
+/// `C:\Users\…` loses every `\` and the char after it. Routed to the
+/// orchestrator when its overlay is open, else the active terminal pane.
+pub async fn handle_paste(app: &mut App, text: String) -> Result<()> {
+    let target = if app.modal == Modal::Orchestrator {
+        app.orchestrator_session_id()
+    } else if app.raw_mode
+        || (app.modal == Modal::None && matches!(app.focus, Focus::GroupA | Focus::GroupB))
+    {
+        app.active_session_id()
+    } else {
+        None // rail focus or a text-editor modal: don't forward to a PTY
+    };
+    if let Some(session_id) = target {
+        app.client
+            .request(Request::WriteStdin { session_id, bytes: bracketed_paste(&text) })
+            .await?;
+    }
+    Ok(())
+}
+
+/// Wrap text in bracketed-paste markers.
+fn bracketed_paste(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
 async fn forward(app: &mut App, key: &KeyEvent) -> Result<()> {
     let Some(session_id) = app.active_session_id() else {
         return Ok(());
@@ -559,7 +591,17 @@ async fn forward(app: &mut App, key: &KeyEvent) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::step_occupied;
+    use super::{bracketed_paste, step_occupied};
+
+    #[test]
+    fn bracketed_paste_frames_text_and_preserves_backslashes() {
+        let out = bracketed_paste(r"C:\Users\simon\Repositories\GeopoliticsSim");
+        // markers present, and the path (backslashes intact) sits between them
+        assert!(out.starts_with(b"\x1b[200~"));
+        assert!(out.ends_with(b"\x1b[201~"));
+        let inner = &out[6..out.len() - 6];
+        assert_eq!(inner, br"C:\Users\simon\Repositories\GeopoliticsSim");
+    }
 
     #[test]
     fn step_occupied_cycles_wraps_and_handles_empty_slots() {

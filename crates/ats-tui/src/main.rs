@@ -8,7 +8,10 @@ use anyhow::{Context, Result};
 use ats_core::client::Client;
 use ats_core::config::Config;
 use ats_core::rpc::{Event, Request, Response};
-use crossterm::event::{Event as CtEvent, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event as CtEvent, EventStream, KeyEventKind,
+};
+use crossterm::execute;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -69,7 +72,11 @@ async fn main() -> Result<()> {
     let client = connect_or_start(&socket).await?;
 
     let mut terminal = ratatui::init();
+    // bracketed paste: the outer terminal frames pastes/drag-drops, and we
+    // re-frame them into the session PTY so the agent treats them literally
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = run(&mut terminal, client, &config).await;
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -145,6 +152,9 @@ async fn run(
                 match ev {
                     Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => {
                         input::handle_key(&mut app, key).await?;
+                    }
+                    Some(Ok(CtEvent::Paste(text))) => {
+                        input::handle_paste(&mut app, text).await?;
                     }
                     Some(Ok(CtEvent::Resize(_, _))) => { /* redraw on next loop */ }
                     Some(Ok(_)) => {}

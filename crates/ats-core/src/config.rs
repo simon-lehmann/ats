@@ -16,6 +16,10 @@ pub struct DaemonConfig {
     pub workspaces_root: String,
     pub scrollback_lines: u32,
     pub idle_threshold_secs: u64,
+    /// Command launched in each session's PTY (the agent CLI).
+    pub session_cmd: String,
+    /// Override the local socket path/name (default: see `default_socket_path`).
+    pub socket_path: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -24,6 +28,8 @@ impl Default for DaemonConfig {
             workspaces_root: String::new(),
             scrollback_lines: 10_000,
             idle_threshold_secs: 8,
+            session_cmd: "claude".into(),
+            socket_path: None,
         }
     }
 }

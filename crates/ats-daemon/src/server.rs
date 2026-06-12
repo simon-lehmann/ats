@@ -25,6 +25,7 @@ pub struct Daemon {
     pub store: Arc<Store>,
     pub sessions: SessionManager,
     pub clones: CloneManager,
+    pub data_dir: PathBuf,
     pub orchestrator: crate::orchestrator::Orchestrator,
     /// interactive-orchestrator conversation (crate::agent); the lock also
     /// serializes chat turns
@@ -41,13 +42,14 @@ impl Daemon {
             store.clone(),
             events.clone(),
             PathBuf::from(&config.daemon.workspaces_root),
-            data_dir,
+            data_dir.clone(),
         );
         let orchestrator = crate::orchestrator::Orchestrator::new(&config.orchestrator);
         Self {
             store,
             sessions,
             clones,
+            data_dir,
             orchestrator,
             orchestrator_history: Mutex::new(Vec::new()),
             events,
@@ -97,25 +99,92 @@ impl Daemon {
             (None, None) => template.kickoff_prompt.map(|p| (None, p)),
         };
         if let Some((note_id, text)) = kickoff {
-            let daemon = self.clone();
-            tokio::spawn(async move {
-                // let the agent CLI finish booting before typing at it
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                let mut bytes = text.into_bytes();
-                bytes.push(b'\r');
-                match daemon.sessions.write_stdin(session_id, &bytes) {
-                    Ok(()) => {
-                        if let Some(note_id) = note_id {
-                            let _ = daemon
-                                .store
-                                .set_note_state(note_id, "claimed", Some(session_id));
-                        }
-                    }
-                    Err(e) => tracing::warn!(session_id, "kickoff send failed: {e:#}"),
-                }
-            });
+            self.schedule_kickoff(session_id, note_id, text);
         }
 
+        let session = self
+            .store
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("session vanished"))?;
+        Ok(Response::Session { session })
+    }
+
+    /// Type `text` into the session once the agent CLI has had a moment to
+    /// boot; mark the note claimed if one was the source.
+    fn schedule_kickoff(self: &Arc<Self>, session_id: i64, note_id: Option<i64>, text: String) {
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let mut bytes = text.into_bytes();
+            bytes.push(b'\r');
+            match daemon.sessions.write_stdin(session_id, &bytes) {
+                Ok(()) => {
+                    if let Some(note_id) = note_id {
+                        let _ = daemon.store.set_note_state(note_id, "claimed", Some(session_id));
+                    }
+                }
+                Err(e) => tracing::warn!(session_id, "kickoff send failed: {e:#}"),
+            }
+        });
+    }
+
+    /// Bare agent session in `cwd` (default: `<data_dir>/scratch`) — no
+    /// workspace clone. Backed by a synthetic "scratch" template row so the
+    /// schema's session→workspace→template chain holds; destroy stays
+    /// guarded because scratch cwds live outside the workspaces root.
+    pub async fn spawn_scratch_session(
+        self: &Arc<Self>,
+        cwd: Option<String>,
+        tab_slot: Option<u8>,
+        kickoff: Option<String>,
+    ) -> Result<Response> {
+        let cwd = match cwd {
+            Some(c) => PathBuf::from(c),
+            None => self.data_dir.join("scratch"),
+        };
+        std::fs::create_dir_all(&cwd)
+            .with_context(|| format!("creating scratch cwd {}", cwd.display()))?;
+        let cwd_str = cwd.to_string_lossy().into_owned();
+
+        let template_id = match self.store.list_templates()?.iter().find(|t| t.name == "scratch") {
+            Some(t) => t.id,
+            None => {
+                self.store
+                    .insert_template(
+                        "scratch",
+                        &self.data_dir.join("scratch").to_string_lossy(),
+                        None,
+                        None,
+                        None,
+                    )?
+                    .id
+            }
+        };
+        let ws_id = self.store.insert_workspace(
+            template_id,
+            &cwd_str,
+            ats_core::state::WorkspaceStatus::Attached,
+        )?;
+
+        let max_slots = self.config.ui.group_a_slots + self.config.ui.group_b_slots;
+        let slot = match tab_slot {
+            Some(s) => Some(s),
+            None => self.store.next_free_tab_slot(max_slots)?,
+        };
+        let session_id = self.store.insert_session(ws_id, slot, None, None)?;
+        let pid = self.sessions.spawn(
+            session_id,
+            &self.config.daemon.session_cmd,
+            &cwd_str,
+            self.store.clone(),
+        )?;
+        if let Some(pid) = pid {
+            let _ = self.store.set_session_pid(session_id, pid);
+            tracing::info!(session_id, pid, path = %cwd_str, "scratch session spawned");
+        }
+        if let Some(text) = kickoff {
+            self.schedule_kickoff(session_id, None, text);
+        }
         let session = self
             .store
             .get_session(session_id)?
@@ -129,6 +198,9 @@ impl Daemon {
             Request::SpawnSession { template_id, tab_slot, kickoff_note_id } => {
                 self.spawn_session_with_kickoff(template_id, tab_slot, kickoff_note_id, None)
                     .await
+            }
+            Request::SpawnScratchSession { cwd, tab_slot, kickoff } => {
+                self.spawn_scratch_session(cwd, tab_slot, kickoff).await
             }
             Request::AttachSession { session_id } => {
                 let data = self.sessions.attach(session_id)?;

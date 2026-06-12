@@ -495,16 +495,20 @@ async fn interactive_orchestrator_spawns_and_instructs_via_tools() {
     let Response::Answer { text } = resp else { panic!("{resp:?}") };
     assert_eq!(text, "Done: session 1 is working on the parser.");
 
-    // tool-call progress was pushed
-    let mut saw_tool_progress = false;
-    while let Ok(ev) = events.try_recv() {
+    // tool-call progress was pushed (events are forwarded after the
+    // response on the same connection — wait, don't poll)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let ev = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("timed out waiting for spawn_session progress event")
+            .expect("event stream closed");
         if let Event::OrchestratorProgress { text } = ev {
             if text.contains("spawn_session") {
-                saw_tool_progress = true;
+                break;
             }
         }
     }
-    assert!(saw_tool_progress, "expected spawn_session progress event");
 
     // the tool really ran: one session exists…
     let resp = client.request(Request::ListSessions).await.unwrap();
@@ -599,6 +603,82 @@ async fn template_kickoff_prompt_reaches_the_agent() {
     }
 
     let _ = client.request(Request::KillSession { session_id: session.id }).await;
+    server_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scratch_session_runs_without_workspace_clone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_str = tmp.path().join("ats-scratch.sock").to_string_lossy().into_owned();
+
+    let mut config = Config::default();
+    config.daemon.workspaces_root =
+        tmp.path().join("workspaces").to_string_lossy().into_owned();
+    config.daemon.session_cmd = "cat".into();
+    config.daemon.idle_threshold_secs = 600;
+
+    let store = Arc::new(Store::open(&tmp.path().join("ats.db")).unwrap());
+    let daemon = Arc::new(server::Daemon::new(config, store, tmp.path().join("data")));
+    let server_handle = tokio::spawn({
+        let daemon = daemon.clone();
+        let s = socket_str.clone();
+        async move { server::serve(daemon, &s).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = Client::connect(&socket_str).await.unwrap();
+    // no templates registered at all — scratch sessions must still work
+    let resp = client
+        .request(Request::SpawnScratchSession {
+            cwd: None,
+            tab_slot: None,
+            kickoff: Some("draft a plan for the migration".into()),
+        })
+        .await
+        .unwrap();
+    let Response::Session { session } = resp else { panic!("{resp:?}") };
+    assert_eq!(session.tab_slot, Some(1));
+    assert!(
+        session.workspace_path.contains("scratch"),
+        "cwd: {}",
+        session.workspace_path
+    );
+    // nothing was cloned into the workspaces root
+    assert!(!tmp.path().join("workspaces").exists());
+
+    // kickoff arrives (cat echoes it)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "kickoff never arrived");
+        let resp = client
+            .request(Request::GetScrollback { session_id: session.id })
+            .await
+            .unwrap();
+        if let Response::Scrollback { data, .. } = resp {
+            if String::from_utf8_lossy(&data).contains("draft a plan for the migration") {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // an explicit cwd also works (e.g. inspecting an existing directory)
+    let other = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    let resp = client
+        .request(Request::SpawnScratchSession {
+            cwd: Some(other.to_string_lossy().into_owned()),
+            tab_slot: None,
+            kickoff: None,
+        })
+        .await
+        .unwrap();
+    let Response::Session { session: s2 } = resp else { panic!() };
+    assert_eq!(s2.workspace_path, other.to_string_lossy());
+    assert_eq!(s2.tab_slot, Some(2));
+
+    let _ = client.request(Request::KillSession { session_id: session.id }).await;
+    let _ = client.request(Request::KillSession { session_id: s2.id }).await;
     server_handle.abort();
 }
 

@@ -83,10 +83,18 @@ fleet-wide workflows are one instruction away:
 ❯ which sessions are blocked, and on what?
 ```
 
-Tool calls stream live into the panel (`→ spawn_session {...}`); the
+The orchestrator knows the ATS workflow: it manages the **notes backlog**
+(draft → finalize → assign-to-session), saves reusable **prompts**, spawns
+**planning sessions** (bare agent in a scratch dir — or any cwd — with no
+workspace clone, for plans/triage alongside project work), digests
+sessions, and can reset/harvest/destroy workspaces when told to. Tool
+calls stream live into the panel (`→ spawn_session {...}`); the
 conversation persists in the daemon across panel closes and clients
 (`Ctrl+r` / `ats orch --reset` clears it). Each instruction is capped at
 12 tool rounds.
+
+Planning sessions are also available directly: `p` in the `Alt+s` modal,
+or `ats scratch [--cwd <dir>] [--kickoff "..."]`.
 
 Also available: one-line digests (`Alt+d` / `ats digest <n>` — heuristic
 for short reports, no API call), one-shot questions (`ats ask`), and

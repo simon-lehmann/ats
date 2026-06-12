@@ -39,6 +39,15 @@ enum Cmd {
         #[arg(long)]
         slot: Option<u8>,
     },
+    /// Bare planning/triage session — no workspace clone
+    Scratch {
+        /// working directory (default: the daemon's scratch dir)
+        #[arg(long)]
+        cwd: Option<String>,
+        /// kickoff instruction typed at the agent once booted
+        #[arg(long)]
+        kickoff: Option<String>,
+    },
     /// Send text to a session's stdin (a trailing Enter is added)
     Send { session_id: i64, text: String },
     /// Print a session's scrollback to stdout
@@ -234,6 +243,19 @@ async fn main() -> Result<()> {
             if let Response::Session { session } = resp {
                 println!(
                     "session {} in {} (tab {})",
+                    session.id,
+                    session.workspace_path,
+                    session.tab_slot.map(|n| n.to_string()).unwrap_or_else(|| "-".into())
+                );
+            }
+        }
+        Cmd::Scratch { cwd, kickoff } => {
+            let resp = client
+                .request(Request::SpawnScratchSession { cwd, tab_slot: None, kickoff })
+                .await?;
+            if let Response::Session { session } = resp {
+                println!(
+                    "planning session {} in {} (tab {})",
                     session.id,
                     session.workspace_path,
                     session.tab_slot.map(|n| n.to_string()).unwrap_or_else(|| "-".into())

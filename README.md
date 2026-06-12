@@ -30,6 +30,43 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+## Quick start
+
+```sh
+# 1. register a template (a blessed, setup-complete local clone)
+ats register api-core ~/repos/api-core
+
+# 2. launch the TUI — it auto-starts the daemon if needed
+ats-tui
+
+# 3. inside the TUI: Alt+s → pick template → workspace cloned, session
+#    spawned in the next free tab. F1 for all keybindings.
+```
+
+Headless: `ats spawn api-core`, `ats status`, `ats scrollback <id>`,
+`ats harvest <ws>`, `ats destroy <ws>`.
+
+Config lives in `./ats.toml` or `~/.ats/ats.toml` (see `ats.example.toml`);
+`session_cmd` defaults to `claude`. Override the socket with `$ATS_SOCKET`,
+the data dir with `$ATS_DATA_DIR`.
+
+## Keybindings (defaults)
+
+| Key | Action |
+|---|---|
+| `Alt+1..5` / `Alt+6..0` | jump to tab in group A / B |
+| `` Alt+` `` | toggle focus group A ↔ B |
+| `Alt+r` | focus rail |
+| `Alt+s` | spawn: template → workspace → session |
+| `Alt+q` | review queue (Enter = jump) |
+| `Alt+Esc` | raw mode (all keys to the PTY) |
+| `Alt+x` | detach UI — agents keep running |
+| `F1` | help |
+
 ## Status
 
-Phase 1 (MVP) in progress — see [docs/PLAN.md §5](docs/PLAN.md) for the phase plan.
+Phase 1 (MVP) complete: daemon-owned PTY sessions, template→workspace clones,
+two-group TUI with live vt100 rendering, attach/detach with scrollback,
+heartbeat status glyphs, headless CLI. Next: Phase 2 rail features
+(notes, prompt clipboard, transcript-based classification, harvest viewer) —
+see [docs/PLAN.md §5](docs/PLAN.md).

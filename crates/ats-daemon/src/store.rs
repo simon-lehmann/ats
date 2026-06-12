@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS templates (
   path TEXT NOT NULL,
   origin_url TEXT,
   setup_cmd TEXT,
+  kickoff_prompt TEXT,
   created_at INTEGER, updated_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -112,6 +113,12 @@ fn ws_status_from_str(s: &str) -> WorkspaceStatus {
     }
 }
 
+/// Columns added after first release; ALTER fails harmlessly when the
+/// column already exists (fresh CREATE includes it).
+fn migrate(conn: &Connection) {
+    let _ = conn.execute("ALTER TABLE templates ADD COLUMN kickoff_prompt TEXT", []);
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -124,12 +131,14 @@ impl Store {
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite db at {}", path.display()))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn);
         Ok(Self { conn: Mutex::new(conn) })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn);
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -141,12 +150,13 @@ impl Store {
         path: &str,
         origin_url: Option<&str>,
         setup_cmd: Option<&str>,
+        kickoff_prompt: Option<&str>,
     ) -> Result<TemplateInfo> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO templates (name, path, origin_url, setup_cmd, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![name, path, origin_url, setup_cmd, now()],
+            "INSERT INTO templates (name, path, origin_url, setup_cmd, kickoff_prompt, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![name, path, origin_url, setup_cmd, kickoff_prompt, now()],
         )?;
         let id = conn.last_insert_rowid();
         Ok(TemplateInfo {
@@ -155,23 +165,16 @@ impl Store {
             path: path.into(),
             origin_url: origin_url.map(Into::into),
             setup_cmd: setup_cmd.map(Into::into),
+            kickoff_prompt: kickoff_prompt.map(Into::into),
         })
     }
 
     pub fn get_template(&self, id: i64) -> Result<Option<TemplateInfo>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, name, path, origin_url, setup_cmd FROM templates WHERE id = ?1",
+            "SELECT id, name, path, origin_url, setup_cmd, kickoff_prompt FROM templates WHERE id = ?1",
             params![id],
-            |r| {
-                Ok(TemplateInfo {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    path: r.get(2)?,
-                    origin_url: r.get(3)?,
-                    setup_cmd: r.get(4)?,
-                })
-            },
+            template_row,
         )
         .optional()
         .map_err(Into::into)
@@ -179,17 +182,10 @@ impl Store {
 
     pub fn list_templates(&self) -> Result<Vec<TemplateInfo>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, name, path, origin_url, setup_cmd FROM templates ORDER BY id")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(TemplateInfo {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                path: r.get(2)?,
-                origin_url: r.get(3)?,
-                setup_cmd: r.get(4)?,
-            })
-        })?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, path, origin_url, setup_cmd, kickoff_prompt FROM templates ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], template_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -239,6 +235,9 @@ impl Store {
                     path: r.get(3)?,
                     branch: r.get(4)?,
                     status: ws_status_from_str(&r.get::<_, String>(5)?),
+                    dirty: None,
+                    ahead: None,
+                    behind: None,
                 })
             },
         )
@@ -272,6 +271,9 @@ impl Store {
                 path: r.get(3)?,
                 branch: r.get(4)?,
                 status: ws_status_from_str(&r.get::<_, String>(5)?),
+                dirty: None,
+                ahead: None,
+                behind: None,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -314,6 +316,72 @@ impl Store {
         conn.execute(
             "UPDATE sessions SET state = ?2, state_detail = ?3 WHERE id = ?1",
             params![id, state_to_str(state), detail],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_transcript(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT transcript_path FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
+    pub fn set_session_transcript(&self, id: i64, path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET transcript_path = ?2 WHERE id = ?1",
+            params![id, path],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_prompt(&self, id: Option<i64>, label: &str, body: &str, kind: &str) -> Result<PromptInfo> {
+        let conn = self.conn.lock().unwrap();
+        let kind = if kind == "reentry" { "reentry" } else { "clipboard" };
+        let id = match id {
+            Some(id) => {
+                conn.execute(
+                    "UPDATE prompts SET label = ?2, body = ?3, kind = ?4 WHERE id = ?1",
+                    params![id, label, body, kind],
+                )?;
+                id
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO prompts (label, body, kind, use_count, last_used_at)
+                     VALUES (?1, ?2, ?3, 0, ?4)",
+                    params![label, body, kind, now()],
+                )?;
+                conn.last_insert_rowid()
+            }
+        };
+        conn.query_row(
+            "SELECT id, label, body, kind, use_count FROM prompts WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(PromptInfo {
+                    id: r.get(0)?,
+                    label: r.get(1)?,
+                    body: r.get(2)?,
+                    kind: r.get(3)?,
+                    use_count: r.get(4)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn insert_digest(&self, session_id: i64, summary: &str, source: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO digests (session_id, summary, source, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, summary, source, now()],
         )?;
         Ok(())
     }
@@ -485,13 +553,24 @@ const SESSION_SELECT: &str = "SELECT s.id, s.workspace_id, s.tab_slot, s.pty_pid
     JOIN workspaces w ON w.id = s.workspace_id
     JOIN templates t ON t.id = w.template_id";
 
+fn template_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TemplateInfo> {
+    Ok(TemplateInfo {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        path: r.get(2)?,
+        origin_url: r.get(3)?,
+        setup_cmd: r.get(4)?,
+        kickoff_prompt: r.get(5)?,
+    })
+}
+
 fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
     let template_name: String = r.get(7)?;
     let path: String = r.get(6)?;
     let title = std::path::Path::new(&path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or(template_name);
+        .unwrap_or_else(|| template_name.clone());
     Ok(SessionInfo {
         id: r.get(0)?,
         workspace_id: r.get(1)?,
@@ -501,6 +580,7 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInfo> {
         state_detail: r.get(5)?,
         workspace_path: path,
         title,
+        template_name,
         created_at: r.get(8)?,
         last_activity_at: r.get(9)?,
     })
@@ -524,7 +604,7 @@ mod tests {
     #[test]
     fn template_workspace_session_round_trip() {
         let store = Store::open_in_memory().unwrap();
-        let t = store.insert_template("api-core", "/tmp/api-core", None, None).unwrap();
+        let t = store.insert_template("api-core", "/tmp/api-core", None, None, None).unwrap();
         let ws = store.insert_workspace(t.id, "/tmp/ws/api-core-1", WorkspaceStatus::Spawning).unwrap();
         store.update_workspace(ws, Some("agent/1"), Some("abc123"), WorkspaceStatus::Ready).unwrap();
 
@@ -547,7 +627,7 @@ mod tests {
     #[test]
     fn tab_slot_allocation_skips_used() {
         let store = Store::open_in_memory().unwrap();
-        let t = store.insert_template("t", "/tmp/t", None, None).unwrap();
+        let t = store.insert_template("t", "/tmp/t", None, None, None).unwrap();
         let ws = store.insert_workspace(t.id, "/tmp/ws1", WorkspaceStatus::Ready).unwrap();
         store.insert_session(ws, Some(1), None, None).unwrap();
         store.insert_session(ws, Some(2), None, None).unwrap();

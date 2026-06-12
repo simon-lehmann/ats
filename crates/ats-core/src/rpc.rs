@@ -38,6 +38,9 @@ pub enum Request {
         name: String,
         path: String,
         setup_cmd: Option<String>,
+        /// sent to new sessions in this template once the agent has booted
+        #[serde(default)]
+        kickoff_prompt: Option<String>,
     },
     ListWorkspaces,
     SpawnWorkspace { template_id: i64 },
@@ -54,6 +57,12 @@ pub enum Request {
     FinalizeNote { id: i64 },
     SendNoteToSession { note_id: i64, session_id: i64 },
     ListPrompts,
+    UpsertPrompt {
+        id: Option<i64>,
+        label: String,
+        body: String,
+        kind: String,
+    },
     UsePrompt { id: i64, session_id: i64 },
     // orchestrator
     SummarizeSession { session_id: i64, force_llm: bool },
@@ -61,6 +70,8 @@ pub enum Request {
         question: String,
         session_ids: Vec<i64>,
     },
+    /// LLM-drafted catch-up note for re-entering a session
+    DraftReentry { session_id: i64 },
     ListReviewQueue,
 }
 
@@ -117,6 +128,7 @@ pub enum Response {
         patch_path: String,
     },
     Digest { session_id: i64, summary: String },
+    Answer { text: String },
 }
 
 /// Events pushed daemon → client (no correlation id).
@@ -157,6 +169,8 @@ pub struct SessionInfo {
     pub tab_slot: Option<u8>,
     pub pid: Option<u32>,
     pub title: String,
+    #[serde(default)]
+    pub template_name: String,
     pub state: SessionState,
     pub state_detail: Option<String>,
     pub workspace_path: String,
@@ -171,6 +185,8 @@ pub struct TemplateInfo {
     pub path: String,
     pub origin_url: Option<String>,
     pub setup_cmd: Option<String>,
+    #[serde(default)]
+    pub kickoff_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +197,13 @@ pub struct WorkspaceInfo {
     pub path: String,
     pub branch: Option<String>,
     pub status: WorkspaceStatus,
+    /// live `git status` figures; None when git info is unavailable
+    #[serde(default)]
+    pub dirty: Option<u32>,
+    #[serde(default)]
+    pub ahead: Option<u32>,
+    #[serde(default)]
+    pub behind: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

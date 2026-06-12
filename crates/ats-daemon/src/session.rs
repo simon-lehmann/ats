@@ -255,24 +255,38 @@ impl SessionManager {
         self.sessions.lock().unwrap().contains_key(&session_id)
     }
 
-    /// Heartbeat sweep (plan §4.1): working sessions with no output past the
-    /// threshold become idle. Run from a periodic tokio task.
-    pub fn sweep_idle(&self, idle_threshold_secs: i64, store: &Store) {
+    /// Heartbeat (plan §4.1): live sessions still marked working whose PTY
+    /// has been quiet past the threshold — candidates for classification.
+    pub fn quiet_working(&self, idle_threshold_secs: i64) -> Vec<i64> {
         let sessions = self.sessions.lock().unwrap();
         let cutoff = now() - idle_threshold_secs;
-        for (&id, h) in sessions.iter() {
+        sessions
+            .iter()
+            .filter(|(_, h)| {
+                *h.state.lock().unwrap() == SessionState::Working
+                    && h.last_output_at.load(Ordering::Relaxed) < cutoff
+            })
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Set a session's state (handle + store) and broadcast the change.
+    pub fn set_state(
+        &self,
+        session_id: i64,
+        state: SessionState,
+        detail: Option<String>,
+        store: &Store,
+    ) {
+        if let Ok(h) = self.handle(session_id) {
             let mut st = h.state.lock().unwrap();
-            if *st == SessionState::Working && h.last_output_at.load(Ordering::Relaxed) < cutoff {
-                *st = SessionState::Idle;
-                let _ = store.set_session_state(id, SessionState::Idle, None);
-                let _ = store.touch_session(id);
-                let _ = self.events.send(Event::SessionStateChanged {
-                    session_id: id,
-                    state: SessionState::Idle,
-                    detail: None,
-                });
+            if *st == SessionState::Dead || *st == state {
+                return;
             }
+            *st = state;
         }
+        let _ = store.set_session_state(session_id, state, detail.as_deref());
+        let _ = self.events.send(Event::SessionStateChanged { session_id, state, detail });
     }
 }
 
@@ -297,7 +311,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn spawn_echo_collect_output_then_dead() {
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let t = store.insert_template("t", "/tmp", None, None).unwrap();
+        let t = store.insert_template("t", "/tmp", None, None, None).unwrap();
         let ws = store
             .insert_workspace(t.id, "/tmp", ats_core::state::WorkspaceStatus::Ready)
             .unwrap();
@@ -346,7 +360,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn stdin_reaches_process() {
         let store = Arc::new(Store::open_in_memory().unwrap());
-        let t = store.insert_template("t", "/tmp", None, None).unwrap();
+        let t = store.insert_template("t", "/tmp", None, None, None).unwrap();
         let ws = store
             .insert_workspace(t.id, "/tmp", ats_core::state::WorkspaceStatus::Ready)
             .unwrap();

@@ -8,11 +8,18 @@ idle_threshold_secs = 8
 [orchestrator]
 model = "claude-haiku-4-5"
 auto_digest = false           # calm by default
+# base_url = "https://api.anthropic.com"   # override for proxies/tests
+# API key comes from $ANTHROPIC_API_KEY
 
 [ui]
 rail_width = 28
 group_a_slots = 5
 group_b_slots = 5
+
+# calm per-template tab tinting (named colors or "#rrggbb")
+# [ui.template_colors]
+# api-core = "cyan"
+# web-app = "#87af87"
 
 # [keys]
 # spawn = "alt+s"

@@ -29,6 +29,9 @@ enum Cmd {
         path: String,
         #[arg(long)]
         setup_cmd: Option<String>,
+        /// kickoff prompt sent to every new session in this template
+        #[arg(long)]
+        kickoff: Option<String>,
     },
     /// Spawn workspace + session from a template (name or id)
     Spawn {
@@ -50,6 +53,62 @@ enum Cmd {
     Destroy { workspace_id: i64 },
     /// Sessions waiting on the developer (finished / needs input / error)
     Queue,
+    /// Block until a session reaches a state (for scripts / agent hooks)
+    Wait {
+        session_id: i64,
+        /// working|idle|finished|needs_input|error|dead
+        #[arg(long)]
+        state: String,
+        /// give up after N seconds (default: wait forever)
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Stream daemon events to stdout as JSON lines (Ctrl+C to stop)
+    Events,
+    /// One-line digest of a session's final report
+    Digest {
+        session_id: i64,
+        /// force the LLM even for short reports
+        #[arg(long)]
+        llm: bool,
+    },
+    /// Ask the orchestrator a question across sessions (all by default)
+    Ask {
+        question: String,
+        session_ids: Vec<i64>,
+    },
+    /// Draft a re-entry briefing note for a session
+    Reentry { session_id: i64 },
+    /// Notes / plans
+    #[command(subcommand)]
+    Note(NoteCmd),
+    /// Prompt clipboard
+    #[command(subcommand)]
+    Prompt(PromptCmd),
+}
+
+#[derive(Subcommand)]
+enum NoteCmd {
+    /// Add a note (body from arg or stdin with '-')
+    Add { title: String, body: String },
+    List,
+    Finalize { id: i64 },
+    /// Send a note's body to a session's stdin
+    Send { id: i64, session_id: i64 },
+}
+
+#[derive(Subcommand)]
+enum PromptCmd {
+    /// Add a prompt to the clipboard
+    Add {
+        label: String,
+        body: String,
+        #[arg(long, default_value = "clipboard")]
+        kind: String,
+    },
+    List,
+    /// Paste a prompt into a session
+    Use { id: i64, session_id: i64 },
 }
 
 fn glyph(state: SessionState) -> &'static str {
@@ -128,7 +187,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Register { name, path, setup_cmd } => {
+        Cmd::Register { name, path, setup_cmd, kickoff } => {
             let abs = std::fs::canonicalize(&path)
                 .map_err(|e| anyhow!("resolving {path}: {e}"))?;
             let resp = client
@@ -136,6 +195,7 @@ async fn main() -> Result<()> {
                     name,
                     path: abs.to_string_lossy().into_owned(),
                     setup_cmd,
+                    kickoff_prompt: kickoff,
                 })
                 .await?;
             if let Response::Template { template } = resp {
@@ -207,6 +267,151 @@ async fn main() -> Result<()> {
                 print_sessions(&sessions);
             }
         }
+        Cmd::Wait { session_id, state, timeout } => {
+            let want = match state.as_str() {
+                "working" => SessionState::Working,
+                "idle" => SessionState::Idle,
+                "finished" => SessionState::Finished,
+                "needs_input" => SessionState::NeedsInput,
+                "error" => SessionState::Error,
+                "dead" => SessionState::Dead,
+                other => bail!("unknown state '{other}'"),
+            };
+            // subscribe first so no transition is missed, then check current
+            let mut events = client.subscribe_events();
+            let resp = client.request(Request::ListSessions).await?;
+            if let Response::Sessions { sessions } = resp {
+                if let Some(s) = sessions.iter().find(|s| s.id == session_id) {
+                    if s.state == want {
+                        println!("{}", s.state_detail.as_deref().unwrap_or(""));
+                        return Ok(());
+                    }
+                } else {
+                    bail!("no session {session_id}");
+                }
+            }
+            let deadline = timeout.map(|t| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(t)
+            });
+            loop {
+                let ev = match deadline {
+                    Some(d) => tokio::time::timeout_at(d, events.recv())
+                        .await
+                        .map_err(|_| anyhow!("timed out waiting for {state}"))?,
+                    None => events.recv().await,
+                };
+                match ev {
+                    Ok(ats_core::rpc::Event::SessionStateChanged {
+                        session_id: sid,
+                        state: got,
+                        detail,
+                    }) if sid == session_id && got == want => {
+                        println!("{}", detail.as_deref().unwrap_or(""));
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(_) => bail!("daemon connection lost"),
+                }
+            }
+        }
+        Cmd::Events => {
+            let mut events = client.subscribe_events();
+            loop {
+                match events.recv().await {
+                    Ok(ev) => {
+                        // PTY output is high-volume noise for scripting
+                        if matches!(ev, ats_core::rpc::Event::PtyOutput { .. }) {
+                            continue;
+                        }
+                        println!("{}", serde_json::to_string(&ev)?);
+                    }
+                    Err(_) => bail!("daemon connection lost"),
+                }
+            }
+        }
+        Cmd::Digest { session_id, llm } => {
+            let resp = client
+                .request(Request::SummarizeSession { session_id, force_llm: llm })
+                .await?;
+            if let Response::Digest { summary, .. } = resp {
+                println!("{summary}");
+            }
+        }
+        Cmd::Ask { question, session_ids } => {
+            let resp = client
+                .request(Request::AskOrchestrator { question, session_ids })
+                .await?;
+            if let Response::Answer { text } = resp {
+                println!("{text}");
+            }
+        }
+        Cmd::Reentry { session_id } => {
+            let resp = client.request(Request::DraftReentry { session_id }).await?;
+            if let Response::Note { note } = resp {
+                println!("note {} — {}\n\n{}", note.id, note.title, note.body);
+            }
+        }
+        Cmd::Note(cmd) => match cmd {
+            NoteCmd::Add { title, body } => {
+                let body = if body == "-" {
+                    use std::io::Read;
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    s
+                } else {
+                    body
+                };
+                let resp = client.request(Request::UpsertNote { id: None, title, body }).await?;
+                if let Response::Note { note } = resp {
+                    println!("note {} ({})", note.id, note.state);
+                }
+            }
+            NoteCmd::List => {
+                let resp = client.request(Request::ListNotes).await?;
+                if let Response::Notes { notes } = resp {
+                    if notes.is_empty() {
+                        println!("no notes");
+                    }
+                    for n in notes {
+                        let pin = if n.pinned { "*" } else { " " };
+                        println!("{:>3} {pin} [{:<9}] {}", n.id, n.state, n.title);
+                    }
+                }
+            }
+            NoteCmd::Finalize { id } => {
+                client.request(Request::FinalizeNote { id }).await?;
+                println!("note {id} finalized");
+            }
+            NoteCmd::Send { id, session_id } => {
+                client
+                    .request(Request::SendNoteToSession { note_id: id, session_id })
+                    .await?;
+                println!("note {id} sent to session {session_id}");
+            }
+        },
+        Cmd::Prompt(cmd) => match cmd {
+            PromptCmd::Add { label, body, kind } => {
+                client
+                    .request(Request::UpsertPrompt { id: None, label, body, kind })
+                    .await?;
+                println!("prompt added");
+            }
+            PromptCmd::List => {
+                let resp = client.request(Request::ListPrompts).await?;
+                if let Response::Prompts { prompts } = resp {
+                    if prompts.is_empty() {
+                        println!("no prompts");
+                    }
+                    for p in prompts {
+                        println!("{:>3}  {:<20} ({}x) {}", p.id, p.label, p.use_count, p.kind);
+                    }
+                }
+            }
+            PromptCmd::Use { id, session_id } => {
+                client.request(Request::UsePrompt { id, session_id }).await?;
+                println!("prompt {id} pasted into session {session_id}");
+            }
+        },
     }
     Ok(())
 }

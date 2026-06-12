@@ -40,6 +40,8 @@ pub struct OrchestratorConfig {
     pub model: String,
     /// Calm by default: digests are on-demand unless this is enabled.
     pub auto_digest: bool,
+    /// API endpoint override (tests, proxies). Default: https://api.anthropic.com
+    pub base_url: Option<String>,
 }
 
 impl Default for OrchestratorConfig {
@@ -47,6 +49,7 @@ impl Default for OrchestratorConfig {
         Self {
             model: "claude-haiku-4-5".into(),
             auto_digest: false,
+            base_url: None,
         }
     }
 }
@@ -57,6 +60,9 @@ pub struct UiConfig {
     pub rail_width: u16,
     pub group_a_slots: u8,
     pub group_b_slots: u8,
+    /// calm per-template tab tinting: template name → color name
+    /// (e.g. `api-core = "cyan"`); unknown names fall back to the default
+    pub template_colors: std::collections::HashMap<String, String>,
 }
 
 impl Default for UiConfig {
@@ -65,6 +71,7 @@ impl Default for UiConfig {
             rail_width: 28,
             group_a_slots: 5,
             group_b_slots: 5,
+            template_colors: std::collections::HashMap::new(),
         }
     }
 }

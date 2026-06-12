@@ -22,25 +22,54 @@ pub struct PaneAreas {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
+    let vsplit = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(frame.area());
+    frame.render_widget(
+        Paragraph::new(Line::styled(format!(" {}", app.status_line), DIM)),
+        vsplit[1],
+    );
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(rail_width), Constraint::Min(20)])
-        .split(frame.area());
+        .split(vsplit[0]);
 
     draw_rail(frame, app, cols[0]);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(cols[1]);
+    let (a_inner, b_inner) = if app.solo {
+        // second-monitor mode: one group, full height
+        let group = if app.focus == Focus::GroupB { Focus::GroupB } else { Focus::GroupA };
+        let inner = draw_group(frame, app, cols[1], group);
+        (inner, inner)
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(cols[1]);
+        (
+            draw_group(frame, app, rows[0], Focus::GroupA),
+            draw_group(frame, app, rows[1], Focus::GroupB),
+        )
+    };
 
-    let a_inner = draw_group(frame, app, rows[0], Focus::GroupA);
-    let b_inner = draw_group(frame, app, rows[1], Focus::GroupB);
-
-    match app.modal {
+    match &app.modal {
         Modal::Help => draw_help(frame),
-        Modal::Spawn { selected } => draw_spawn(frame, app, selected),
-        Modal::Queue { selected } => draw_queue(frame, app, selected),
+        Modal::Spawn { selected } => draw_spawn(frame, app, *selected),
+        Modal::Queue { selected } => draw_queue(frame, app, *selected),
+        Modal::Notes { selected } => draw_notes(frame, app, *selected),
+        Modal::NoteEdit { title, body, editing_body, .. } => {
+            draw_editor(frame, "note — Tab title/body, Ctrl+s save", title, body, *editing_body)
+        }
+        Modal::Palette { query, selected } => draw_palette(frame, app, query, *selected),
+        Modal::Orchestrator { question, answer, busy } => {
+            draw_orchestrator(frame, question, answer.as_deref(), *busy)
+        }
+        Modal::Diff { title, lines, scroll } => draw_diff(frame, title, lines, *scroll),
+        Modal::PromptEdit { label, body, editing_body } => {
+            draw_editor(frame, "prompt — Tab label/body, Ctrl+s save", label, body, *editing_body)
+        }
         Modal::None => {}
     }
 
@@ -67,9 +96,31 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| w.template_name.clone());
+        // git figures: "clean" / "~3" dirty, "+2/-1" ahead/behind
+        let git = match (w.dirty, w.ahead, w.behind) {
+            (Some(0), Some(0), Some(0)) | (Some(0), None, None) => "clean".to_string(),
+            (dirty, ahead, behind) => {
+                let mut parts = Vec::new();
+                if let Some(d) = dirty.filter(|d| *d > 0) {
+                    parts.push(format!("~{d}"));
+                }
+                if let Some(a) = ahead.filter(|a| *a > 0) {
+                    parts.push(format!("+{a}"));
+                }
+                if let Some(b) = behind.filter(|b| *b > 0) {
+                    parts.push(format!("-{b}"));
+                }
+                if parts.is_empty() { "clean".into() } else { parts.join(" ") }
+            }
+        };
+        let dirty_style = if git == "clean" { DIM } else { NORMAL };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {name:<18}"), NORMAL),
-            Span::styled(format!("{:?}", w.status).to_lowercase(), DIM),
+            Span::styled(format!("  {name:<14}"), NORMAL),
+            Span::styled(format!("{git:<8}"), dirty_style),
+            Span::styled(
+                w.branch.clone().unwrap_or_default(),
+                DIM,
+            ),
         ]));
     }
 
@@ -96,6 +147,27 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::styled(text, glyph_style(s.state)));
     }
 
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(format!("▾ PROMPTS ({})", app.prompts.len()), DIM));
+    for p in app.prompts.iter().take(3) {
+        let mut text = format!("  {}", p.label);
+        text.truncate(area.width.saturating_sub(2) as usize);
+        lines.push(Line::styled(text, DIM));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(format!("▾ NOTES ({})", app.notes.len()), DIM));
+    for n in app.notes.iter().take(4) {
+        let marker = match n.state.as_str() {
+            "finalized" => "▪",
+            "claimed" => "→",
+            _ => "·",
+        };
+        let mut text = format!("  {marker} {}", n.title);
+        text.truncate(area.width.saturating_sub(2) as usize);
+        lines.push(Line::styled(text, DIM));
+    }
+
     let border_style = if app.focus == Focus::Rail { ACTIVE } else { DIM };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -111,10 +183,11 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
         (app.a_slots + 1, app.b_slots, app.active_b)
     };
 
-    // tab bar: number + short name + glyph, dim
+    // tab bar: number + short name + glyph, dim; per-template tint stays calm
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for slot in first..first + count {
-        let label = match app.session_in_slot(slot) {
+        let session = app.session_in_slot(slot);
+        let label = match session {
             Some(s) => {
                 let mut name = s.title.clone();
                 name.truncate(10);
@@ -122,10 +195,13 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
             }
             None => format!("{} —", slot_key_label(slot)),
         };
+        let tint = session
+            .and_then(|s| app.template_colors.get(&s.template_name))
+            .and_then(|name| parse_color(name));
         let style = if slot == active {
             if app.focus == group { ACTIVE } else { NORMAL }
         } else {
-            DIM
+            tint.map(|c| Style::new().fg(c)).unwrap_or(DIM)
         };
         spans.push(Span::styled(format!(" {label} "), style));
         spans.push(Span::styled("│", DIM));
@@ -169,6 +245,64 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
 /// Map a tab slot to the key that reaches it (slot 10 = key 0).
 fn slot_key_label(slot: u8) -> String {
     if slot == 10 { "0".into() } else { slot.to_string() }
+}
+
+/// Named or `#rrggbb` colors for `[ui.template_colors]`.
+fn parse_color(name: &str) -> Option<Color> {
+    let n = name.trim().to_lowercase();
+    if let Some(hex) = n.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color::Rgb(r, g, b));
+        }
+        return None;
+    }
+    Some(match n.as_str() {
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "gray" | "grey" => Color::Gray,
+        "darkgray" | "darkgrey" => Color::DarkGray,
+        "white" => Color::White,
+        _ => return None,
+    })
+}
+
+fn draw_diff(frame: &mut Frame, title: &str, lines: &[String], scroll: usize) {
+    let area = frame.area();
+    let w = area.width.saturating_sub(6).min(110);
+    let h = area.height.saturating_sub(4);
+    let view = centered(frame, w, h);
+    let visible = (h as usize).saturating_sub(2);
+
+    let mut rendered: Vec<Line> = Vec::new();
+    for l in lines.iter().skip(scroll).take(visible) {
+        let style = if l.starts_with('+') && !l.starts_with("+++") {
+            Style::new().fg(Color::Green)
+        } else if l.starts_with('-') && !l.starts_with("---") {
+            Style::new().fg(Color::Red)
+        } else if l.starts_with("@@") {
+            Style::new().fg(Color::Cyan)
+        } else if l.starts_with("diff ") || l.starts_with("index ") {
+            ACTIVE
+        } else {
+            NORMAL
+        };
+        let mut text = l.clone();
+        text.truncate(w.saturating_sub(2) as usize);
+        rendered.push(Line::styled(text, style));
+    }
+    if rendered.is_empty() {
+        rendered.push(Line::styled("  (no changes against base)", DIM));
+    }
+    let pos = format!(" {title} — {}/{} (↑↓ PgUp/PgDn, Esc) ", scroll, lines.len());
+    frame.render_widget(Clear, view);
+    frame.render_widget(Paragraph::new(rendered).block(modal_block(&pos)), view);
 }
 
 fn vt_color(c: vt100::Color) -> Color {
@@ -248,6 +382,11 @@ fn draw_help(frame: &mut Frame) {
         ("Alt+r", "focus rail"),
         ("Alt+s", "spawn: template → workspace → session"),
         ("Alt+q", "review queue (Enter jump, Esc close)"),
+        ("Alt+n", "notes: n new, e edit, f finalize, Enter send"),
+        ("Alt+p", "prompt palette (type to filter, Enter paste)"),
+        ("Alt+d", "digest the active session (one line)"),
+        ("Alt+o", "orchestrator: ask across all sessions"),
+        ("Alt+h", "harvest active workspace → diff viewer"),
         ("Alt+Esc", "raw mode: forward all keys to the terminal"),
         ("Alt+x", "detach UI (daemon and agents keep running)"),
         ("F1 / Esc", "this help / close"),
@@ -282,6 +421,115 @@ fn draw_spawn(frame: &mut Frame, app: &App, selected: usize) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(modal_block("spawn session — Enter to confirm")),
+        area,
+    );
+}
+
+fn draw_notes(frame: &mut Frame, app: &App, selected: usize) {
+    let mut lines: Vec<Line> = Vec::new();
+    if app.notes.is_empty() {
+        lines.push(Line::styled("  no notes — n to draft one", DIM));
+    }
+    for (i, n) in app.notes.iter().enumerate() {
+        let style = if i == selected { ACTIVE } else { NORMAL };
+        let marker = if i == selected { "▸" } else { " " };
+        let pin = if n.pinned { "*" } else { " " };
+        let mut text = format!(" {marker}{pin}[{:<9}] {}", n.state, n.title);
+        text.truncate(70);
+        lines.push(Line::styled(text, style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  n new · e edit · f finalize · Enter send to active session",
+        DIM,
+    ));
+    let area = centered(frame, 74, (lines.len() as u16 + 2).max(6));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(modal_block("notes")), area);
+}
+
+fn draw_editor(frame: &mut Frame, title: &str, first: &str, body: &str, editing_body: bool) {
+    let (first_style, body_style) = if editing_body { (NORMAL, ACTIVE) } else { (ACTIVE, NORMAL) };
+    let mut lines = vec![
+        Line::styled(format!("{first}{}", if editing_body { "" } else { "▎" }), first_style),
+        Line::styled("─".repeat(66), DIM),
+    ];
+    for l in body.split('\n') {
+        lines.push(Line::styled(l.to_string(), body_style));
+    }
+    if editing_body {
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::styled("▎", ACTIVE));
+        }
+    }
+    let area = centered(frame, 70, (lines.len() as u16 + 2).clamp(8, 24));
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(modal_block(title)), area);
+}
+
+fn draw_palette(frame: &mut Frame, app: &App, query: &str, selected: usize) {
+    let filtered = app.filtered_prompts(query);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("  ❯ ", DIM),
+            Span::styled(query.to_string(), ACTIVE),
+            Span::styled("▎", ACTIVE),
+        ]),
+        Line::styled("─".repeat(66), DIM),
+    ];
+    if filtered.is_empty() {
+        lines.push(Line::styled("  no matches — Ctrl+n to add a prompt", DIM));
+    }
+    for (i, p) in filtered.iter().take(12).enumerate() {
+        let style = if i == selected { ACTIVE } else { NORMAL };
+        let marker = if i == selected { "▸" } else { " " };
+        let preview: String = p.body.split('\n').next().unwrap_or("").chars().take(34).collect();
+        let mut text = format!(" {marker} {:<18} {preview}", p.label);
+        text.truncate(68);
+        lines.push(Line::styled(text, style));
+    }
+    let area = centered(frame, 70, (lines.len() as u16 + 2).max(7));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(modal_block("prompts — Enter pastes into active session")),
+        area,
+    );
+}
+
+fn draw_orchestrator(frame: &mut Frame, question: &str, answer: Option<&str>, busy: bool) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  ? ", DIM),
+            Span::styled(question.to_string(), ACTIVE),
+            Span::styled(if busy { "" } else { "▎" }, ACTIVE),
+        ]),
+        Line::styled("─".repeat(70), DIM),
+    ];
+    if busy {
+        lines.push(Line::styled("  thinking…", DIM));
+    } else if let Some(a) = answer {
+        for l in a.lines() {
+            // crude wrap at panel width
+            let mut rest = l;
+            loop {
+                let take = rest.chars().take(70).collect::<String>();
+                lines.push(Line::styled(format!("  {take}"), NORMAL));
+                if rest.chars().count() <= 70 {
+                    break;
+                }
+                rest = &rest[take.len()..];
+            }
+        }
+    } else {
+        lines.push(Line::styled(
+            "  ask across all sessions, e.g. \"which sessions are blocked?\"",
+            DIM,
+        ));
+    }
+    let area = centered(frame, 76, (lines.len() as u16 + 2).clamp(7, 28));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(modal_block("orchestrator — Enter to ask")),
         area,
     );
 }

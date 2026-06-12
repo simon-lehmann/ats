@@ -28,14 +28,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 portable-pty = "0.8"
 vt100 = "0.15"
 rusqlite = { version = "0.31", features = ["bundled"] }
-notify = "6"
 interprocess = { version = "2", features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # tui
 ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
-nucleo = "0.5"
 futures = "0.3"
 
 # cli

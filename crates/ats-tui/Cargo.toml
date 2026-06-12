@@ -17,7 +17,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-nucleo = { workspace = true }
 vt100 = { workspace = true }
 interprocess = { workspace = true }
 futures = { workspace = true }

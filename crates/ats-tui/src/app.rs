@@ -1,0 +1,197 @@
+//! Application state: sessions, workspaces, focus, attached terminals.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use anyhow::Result;
+use ats_core::client::Client;
+use ats_core::rpc::{Request, Response, SessionInfo, TemplateInfo, WorkspaceInfo};
+use ats_core::state::SessionState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Rail,
+    GroupA,
+    GroupB,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modal {
+    None,
+    Help,
+    /// template picker for Alt+s
+    Spawn { selected: usize },
+    /// review queue drain mode for Alt+q
+    Queue { selected: usize },
+}
+
+/// One attached terminal: a client-side vt100 screen fed from scrollback +
+/// live PtyOutput events.
+pub struct Term {
+    pub parser: vt100::Parser,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+pub struct App {
+    pub client: Arc<Client>,
+    pub sessions: Vec<SessionInfo>,
+    pub workspaces: Vec<WorkspaceInfo>,
+    pub templates: Vec<TemplateInfo>,
+    pub focus: Focus,
+    /// active slot per group (group A: 1..=a_slots, group B: a_slots+1..=a+b)
+    pub active_a: u8,
+    pub active_b: u8,
+    pub a_slots: u8,
+    pub b_slots: u8,
+    pub modal: Modal,
+    /// everything-through mode: only the toggle key is intercepted
+    pub raw_mode: bool,
+    pub terms: HashMap<i64, Term>,
+    pub status_line: String,
+    pub should_quit: bool,
+}
+
+impl App {
+    pub fn new(client: Arc<Client>, a_slots: u8, b_slots: u8) -> Self {
+        Self {
+            client,
+            sessions: Vec::new(),
+            workspaces: Vec::new(),
+            templates: Vec::new(),
+            focus: Focus::GroupA,
+            active_a: 1,
+            active_b: a_slots + 1,
+            a_slots,
+            b_slots,
+            modal: Modal::None,
+            raw_mode: false,
+            terms: HashMap::new(),
+            status_line: String::new(),
+            should_quit: false,
+        }
+    }
+
+    pub fn session_in_slot(&self, slot: u8) -> Option<&SessionInfo> {
+        self.sessions
+            .iter()
+            .filter(|s| s.tab_slot == Some(slot))
+            .max_by_key(|s| s.id)
+    }
+
+    pub fn active_slot(&self) -> u8 {
+        match self.focus {
+            Focus::GroupB => self.active_b,
+            _ => self.active_a,
+        }
+    }
+
+    pub fn active_session_id(&self) -> Option<i64> {
+        self.session_in_slot(self.active_slot()).map(|s| s.id)
+    }
+
+    pub fn review_queue(&self) -> Vec<&SessionInfo> {
+        self.sessions
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    SessionState::Finished | SessionState::NeedsInput | SessionState::Error
+                )
+            })
+            .collect()
+    }
+
+    pub async fn refresh(&mut self) -> Result<()> {
+        if let Response::Sessions { sessions } = self.client.request(Request::ListSessions).await? {
+            self.sessions = sessions;
+        }
+        if let Response::Workspaces { workspaces } =
+            self.client.request(Request::ListWorkspaces).await?
+        {
+            self.workspaces = workspaces;
+        }
+        if let Response::Templates { templates } =
+            self.client.request(Request::ListTemplates).await?
+        {
+            self.templates = templates;
+        }
+        Ok(())
+    }
+
+    /// Make sure the sessions visible in both groups are attached, and
+    /// nothing else is. Returns ids that need a daemon-side resize.
+    pub async fn sync_attachments(&mut self, pane_a: (u16, u16), pane_b: (u16, u16)) -> Result<()> {
+        let mut want: Vec<(i64, (u16, u16))> = Vec::new();
+        if let Some(s) = self.session_in_slot(self.active_a) {
+            want.push((s.id, pane_a));
+        }
+        if let Some(s) = self.session_in_slot(self.active_b) {
+            want.push((s.id, pane_b));
+        }
+
+        let current: Vec<i64> = self.terms.keys().copied().collect();
+        for id in current {
+            if !want.iter().any(|(w, _)| *w == id) {
+                self.terms.remove(&id);
+                let _ = self
+                    .client
+                    .request(Request::DetachSession { session_id: id })
+                    .await;
+            }
+        }
+
+        for (id, (cols, rows)) in want {
+            let (cols, rows) = (cols.max(10), rows.max(3));
+            if let Some(term) = self.terms.get_mut(&id) {
+                if term.cols != cols || term.rows != rows {
+                    term.parser.set_size(rows, cols);
+                    term.cols = cols;
+                    term.rows = rows;
+                    let _ = self
+                        .client
+                        .request(Request::ResizeSession { session_id: id, cols, rows })
+                        .await;
+                }
+                continue;
+            }
+            let resp = self
+                .client
+                .request(Request::AttachSession { session_id: id })
+                .await?;
+            let mut parser = vt100::Parser::new(rows, cols, 2000);
+            if let Response::Scrollback { data, .. } = resp {
+                parser.process(&data);
+            }
+            self.terms.insert(id, Term { parser, cols, rows });
+            let _ = self
+                .client
+                .request(Request::ResizeSession { session_id: id, cols, rows })
+                .await;
+        }
+        Ok(())
+    }
+
+    pub fn feed_output(&mut self, session_id: i64, bytes: &[u8]) {
+        if let Some(term) = self.terms.get_mut(&session_id) {
+            term.parser.process(bytes);
+        }
+    }
+
+    pub fn set_session_state(&mut self, session_id: i64, state: SessionState, detail: Option<String>) {
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            s.state = state;
+            s.state_detail = detail;
+        }
+    }
+}
+
+pub fn state_glyph(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Working => "·",
+        SessionState::Idle => "○",
+        SessionState::Finished => "●",
+        SessionState::NeedsInput | SessionState::Error => "!",
+        SessionState::Dead => "✕",
+    }
+}

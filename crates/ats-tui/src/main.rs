@@ -1,5 +1,203 @@
 //! ats-tui: Ratatui client. Left rail + two tab groups of five sessions.
+//! Detaching (Alt+x) never kills agents — the daemon owns them.
 
-fn main() {
-    println!("ats-tui: not yet implemented (see docs/PLAN.md, Phase 1)");
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use ats_core::client::Client;
+use ats_core::config::Config;
+use ats_core::rpc::Event;
+use crossterm::event::{Event as CtEvent, EventStream, KeyEventKind};
+use futures::StreamExt;
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+
+mod app;
+mod input;
+mod ui;
+
+use app::App;
+
+fn load_config() -> Config {
+    for path in [
+        std::path::PathBuf::from("ats.toml"),
+        ats_core::data_dir().join("ats.toml"),
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(cfg) = Config::from_toml(&raw) {
+                return cfg;
+            }
+        }
+    }
+    Config::default()
+}
+
+/// Connect to the daemon, starting one if none is running.
+async fn connect_or_start(socket: &str) -> Result<Arc<Client>> {
+    if let Ok(c) = Client::connect(socket).await {
+        return Ok(c);
+    }
+    let exe = std::env::current_exe()?;
+    let daemon = exe.with_file_name(if cfg!(windows) { "ats-daemon.exe" } else { "ats-daemon" });
+    let log = ats_core::data_dir().join("daemon.log");
+    std::fs::create_dir_all(ats_core::data_dir())?;
+    let logfile = std::fs::File::create(&log)?;
+    std::process::Command::new(&daemon)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(logfile.try_clone()?))
+        .stderr(std::process::Stdio::from(logfile))
+        .spawn()
+        .with_context(|| format!("starting {}", daemon.display()))?;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(c) = Client::connect(socket).await {
+            return Ok(c);
+        }
+    }
+    anyhow::bail!("daemon did not come up on {socket} (log: {})", log.display())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config = load_config();
+    let socket = config
+        .daemon
+        .socket_path
+        .clone()
+        .unwrap_or_else(ats_core::default_socket_path);
+    let client = connect_or_start(&socket).await?;
+
+    let mut terminal = ratatui::init();
+    let result = run(&mut terminal, client, &config).await;
+    ratatui::restore();
+    result
+}
+
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    client: Arc<Client>,
+    config: &Config,
+) -> Result<()> {
+    let mut app = App::new(client.clone(), config.ui.group_a_slots, config.ui.group_b_slots);
+    app.refresh().await?;
+
+    let mut events = client.subscribe_events();
+    let mut term_events = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(2000));
+    let rail_width = config.ui.rail_width;
+
+    loop {
+        // draw, remembering pane sizes for attach/resize bookkeeping
+        let mut areas = None;
+        terminal.draw(|frame| {
+            areas = Some(ui::draw(frame, &app, rail_width));
+        })?;
+        if let Some(areas) = areas {
+            let pane_a = (areas.a_inner.width, areas.a_inner.height);
+            let pane_b = (areas.b_inner.width, areas.b_inner.height);
+            if let Err(e) = app.sync_attachments(pane_a, pane_b).await {
+                app.status_line = format!("attach: {e:#}");
+            }
+        }
+        if app.should_quit {
+            return Ok(());
+        }
+
+        tokio::select! {
+            ev = term_events.next() => {
+                match ev {
+                    Some(Ok(CtEvent::Key(key))) if key.kind != KeyEventKind::Release => {
+                        input::handle_key(&mut app, key).await?;
+                    }
+                    Some(Ok(CtEvent::Resize(_, _))) => { /* redraw on next loop */ }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
+                }
+            }
+            ev = events.recv() => {
+                match ev {
+                    Ok(Event::PtyOutput { session_id, bytes }) => {
+                        app.feed_output(session_id, &bytes);
+                        // drain any burst of output before redrawing
+                        while let Ok(Event::PtyOutput { session_id, bytes }) = events.try_recv() {
+                            app.feed_output(session_id, &bytes);
+                        }
+                    }
+                    Ok(Event::SessionStateChanged { session_id, state, detail }) => {
+                        app.set_session_state(session_id, state, detail);
+                        if state == ats_core::state::SessionState::Dead {
+                            let _ = app.refresh().await;
+                        }
+                    }
+                    Ok(Event::WorkspaceStatusChanged { .. }) => {
+                        let _ = app.refresh().await;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!("daemon connection lost");
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                let _ = app.refresh().await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    // Layout snapshot (plan §6): rail sections and both tab groups render.
+    #[tokio::test]
+    async fn layout_renders_rail_and_groups() {
+        // a client that never connects isn't needed for pure rendering;
+        // build App with a dummy client via an in-process socket-less path is
+        // overkill — render with a default App built around an unconnected
+        // client is impossible, so render the UI parts directly instead.
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // App::new needs a Client; spin a daemonless fake via a socketpair is
+        // heavy. Instead, validate via the daemon e2e test for behavior and
+        // here only check ui::draw with a stub App is structurally sound.
+        // Connect to a real micro-daemon over a temp socket:
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("tui-test.sock").to_string_lossy().into_owned();
+        let mut config = ats_core::config::Config::default();
+        config.daemon.workspaces_root = tmp.path().join("ws").to_string_lossy().into_owned();
+        let store = std::sync::Arc::new(ats_daemon::store::Store::open(&tmp.path().join("db")).unwrap());
+        let daemon = std::sync::Arc::new(ats_daemon::server::Daemon::new(
+            config,
+            store,
+            tmp.path().join("data"),
+        ));
+        let handle = tokio::spawn({
+            let daemon = daemon.clone();
+            let socket = socket.clone();
+            async move { ats_daemon::server::serve(daemon, &socket).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let client = Client::connect(&socket).await.unwrap();
+        let mut app = App::new(client, 5, 5);
+        app.refresh().await.unwrap();
+
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &app, 28);
+            })
+            .unwrap();
+
+        let text = format!("{:?}", terminal.backend().buffer());
+        assert!(text.contains("WORKSPACES"));
+        assert!(text.contains("REVIEW QUEUE"));
+        assert!(text.contains("empty slot"));
+        handle.abort();
+    }
 }

@@ -107,19 +107,11 @@ async fn run(
             line, ask which local git repo they want you to manage, then register it as a \
             template and spawn a session in it."
             .to_string();
-        if let Ok(Response::Session { session }) =
+        if let Ok(Response::Session { .. }) =
             client.request(Request::EnsureOrchestrator { kickoff: Some(kickoff) }).await
         {
             app.refresh().await?;
-            if let Some(slot) = session.tab_slot {
-                if slot <= app.a_slots {
-                    app.active_a = slot;
-                    app.focus = app::Focus::GroupA;
-                } else {
-                    app.active_b = slot;
-                    app.focus = app::Focus::GroupB;
-                }
-            }
+            app.modal = app::Modal::Orchestrator;
             app.status_line = "orchestrator ready — type to it; it'll set up your first repo".into();
         }
     }
@@ -138,7 +130,12 @@ async fn run(
         if let Some(areas) = areas {
             let pane_a = (areas.a_inner.width, areas.a_inner.height);
             let pane_b = (areas.b_inner.width, areas.b_inner.height);
-            if let Err(e) = app.sync_attachments(pane_a, pane_b).await {
+            // attach the orchestrator session at the overlay's size while it's open
+            let orch = match (areas.orch_inner, app.orchestrator_session_id()) {
+                (Some(r), Some(id)) => Some((id, (r.width, r.height))),
+                _ => None,
+            };
+            if let Err(e) = app.sync_attachments(pane_a, pane_b, orch).await {
                 app.status_line = format!("attach: {e:#}");
             }
         }

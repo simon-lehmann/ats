@@ -35,6 +35,9 @@ pub enum Modal {
     },
     /// fuzzy prompt palette for Alt+p
     Palette { query: String, selected: usize },
+    /// the orchestrator's live Claude Code session, hosted as a centered
+    /// overlay (Alt+o). Keys are forwarded to its PTY; Esc/Alt+o closes.
+    Orchestrator,
     /// harvest diff viewer for Alt+h
     Diff {
         title: String,
@@ -162,6 +165,11 @@ impl App {
         self.session_in_slot(self.active_slot()).map(|s| s.id)
     }
 
+    /// The orchestrator session (no tab slot; shown in the Alt+o overlay).
+    pub fn orchestrator_session_id(&self) -> Option<i64> {
+        self.sessions.iter().find(|s| s.is_orchestrator).map(|s| s.id)
+    }
+
     pub fn review_queue(&self) -> Vec<&SessionInfo> {
         self.sessions
             .iter()
@@ -214,7 +222,12 @@ impl App {
 
     /// Make sure the visible sessions (both groups, or just the focused
     /// one in solo mode) are attached, and nothing else is.
-    pub async fn sync_attachments(&mut self, pane_a: (u16, u16), pane_b: (u16, u16)) -> Result<()> {
+    pub async fn sync_attachments(
+        &mut self,
+        pane_a: (u16, u16),
+        pane_b: (u16, u16),
+        orch: Option<(i64, (u16, u16))>,
+    ) -> Result<()> {
         let mut want: Vec<(i64, (u16, u16))> = Vec::new();
         let visible = self.visible_slots();
         if visible.contains(&self.active_a) {
@@ -225,6 +238,12 @@ impl App {
         if visible.contains(&self.active_b) {
             if let Some(s) = self.session_in_slot(self.active_b) {
                 want.push((s.id, pane_b));
+            }
+        }
+        // the orchestrator overlay, when open, hosts its session live
+        if let Some(orch) = orch {
+            if !want.iter().any(|(id, _)| *id == orch.0) {
+                want.push(orch);
             }
         }
 

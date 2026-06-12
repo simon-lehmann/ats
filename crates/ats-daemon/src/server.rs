@@ -250,6 +250,8 @@ impl Daemon {
             .await?;
         if let Response::Session { session } = &resp {
             self.store.mark_orchestrator(session.id)?;
+            // the orchestrator lives in its overlay, not a group tab
+            self.store.clear_tab_slot(session.id)?;
             if let Some(updated) = self.store.get_session(session.id)? {
                 return Ok(Response::Session { session: updated });
             }

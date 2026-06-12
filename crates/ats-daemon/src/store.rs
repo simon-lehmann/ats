@@ -467,7 +467,9 @@ impl Store {
         .map_err(Into::into)
     }
 
-    pub fn clear_dead_tab_slot(&self, session_id: i64) -> Result<()> {
+    /// Detach a session from any tab slot (on death, or for the orchestrator,
+    /// which lives in its overlay rather than a group tab).
+    pub fn clear_tab_slot(&self, session_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE sessions SET tab_slot = NULL WHERE id = ?1",

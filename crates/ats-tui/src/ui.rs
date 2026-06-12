@@ -19,6 +19,8 @@ const ALERT: Style = Style::new().fg(Color::Yellow);
 pub struct PaneAreas {
     pub a_inner: Rect,
     pub b_inner: Rect,
+    /// inner rect of the orchestrator overlay when it's open (for PTY sizing)
+    pub orch_inner: Option<Rect>,
 }
 
 pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
@@ -51,6 +53,7 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
         )
     };
 
+    let mut orch_inner = None;
     match &app.modal {
         Modal::Help => draw_help(frame),
         Modal::Spawn { selected } => draw_spawn(frame, app, *selected),
@@ -60,6 +63,7 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
             draw_editor(frame, "note — Tab title/body, Ctrl+s save", title, body, *editing_body)
         }
         Modal::Palette { query, selected } => draw_palette(frame, app, query, *selected),
+        Modal::Orchestrator => orch_inner = Some(draw_orchestrator_overlay(frame, app)),
         Modal::Diff { title, lines, scroll } => draw_diff(frame, title, lines, *scroll),
         Modal::PromptEdit { label, body, editing_body } => {
             draw_editor(frame, "prompt — Tab label/body, Ctrl+s save", label, body, *editing_body)
@@ -67,7 +71,25 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
         Modal::None => {}
     }
 
-    PaneAreas { a_inner, b_inner }
+    PaneAreas { a_inner, b_inner, orch_inner }
+}
+
+/// Centered overlay hosting the orchestrator's live Claude Code session.
+/// Returns the inner rect so the session's PTY can be sized to match.
+fn draw_orchestrator_overlay(frame: &mut Frame, app: &App) -> Rect {
+    let area = frame.area();
+    let w = area.width.saturating_sub(6).min(120);
+    let h = area.height.saturating_sub(3);
+    let view = centered(frame, w, h);
+    let block = modal_block("orchestrator — Esc to close · keys go to the agent");
+    let inner = block.inner(view);
+    frame.render_widget(Clear, view);
+    frame.render_widget(block, view);
+    match app.orchestrator_session_id().and_then(|id| app.terms.get(&id)) {
+        Some(term) => render_screen(frame.buffer_mut(), term.parser.screen(), inner),
+        None => frame.render_widget(Paragraph::new(Line::styled("  attaching…", DIM)), inner),
+    }
+    inner
 }
 
 /// Bottom strip: a transient status message when one is set, otherwise a
@@ -149,6 +171,7 @@ fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Modal::Palette { .. } => {
             vec![("type", "filter"), ("Enter", "paste"), ("Ctrl+n", "add"), ("Esc", "close")]
         }
+        Modal::Orchestrator => vec![("Esc", "close"), ("", "keys go to the orchestrator")],
         Modal::Diff { .. } => vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "close")],
     }
 }
@@ -272,15 +295,9 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
             }
             None => format!("{} —", slot_key_label(slot)),
         };
-        // the orchestrator tab gets a calm magenta tint so Alt+o's target reads
-        // at a glance; other tabs use their per-template color if configured
-        let tint = if session.map(|s| s.is_orchestrator).unwrap_or(false) {
-            Some(Color::Magenta)
-        } else {
-            session
-                .and_then(|s| app.template_colors.get(&s.template_name))
-                .and_then(|name| parse_color(name))
-        };
+        let tint = session
+            .and_then(|s| app.template_colors.get(&s.template_name))
+            .and_then(|name| parse_color(name));
         let style = if slot == active {
             if app.focus == group { ACTIVE } else { NORMAL }
         } else {

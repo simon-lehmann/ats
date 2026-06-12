@@ -172,16 +172,14 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 }
                 return Ok(());
             }
-            // jump to the orchestrator Claude Code session (spawning it if
-            // needed); it drives the fleet via the ATS MCP tools
+            // open the orchestrator overlay (spawning the session if needed);
+            // it drives the fleet via the ATS MCP tools
             KeyCode::Char('o') => {
                 app.status_line = "opening orchestrator…".into();
                 match app.client.request(Request::EnsureOrchestrator { kickoff: None }).await {
-                    Ok(ats_core::rpc::Response::Session { session }) => {
+                    Ok(ats_core::rpc::Response::Session { .. }) => {
                         app.refresh().await?;
-                        if let Some(slot) = session.tab_slot {
-                            jump_to_slot(app, slot);
-                        }
+                        app.modal = Modal::Orchestrator;
                         app.status_line.clear();
                     }
                     Ok(_) => {}
@@ -447,6 +445,24 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 KeyCode::Home => app.modal = Modal::Diff { title, lines, scroll: 0 },
                 KeyCode::End => app.modal = Modal::Diff { title, lines, scroll: max },
                 _ => app.modal = Modal::Diff { title, lines, scroll },
+            }
+        }
+        // the orchestrator overlay hosts a live session: forward every key to
+        // its PTY; Esc (or Alt+o again) closes the overlay, leaving it running
+        Modal::Orchestrator => {
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            if key.code == KeyCode::Esc || (alt && key.code == KeyCode::Char('o')) {
+                // closed: sync_attachments will detach it on the next frame
+            } else {
+                if let Some(id) = app.orchestrator_session_id() {
+                    let bytes = key_to_bytes(&key);
+                    if !bytes.is_empty() {
+                        app.client
+                            .request(Request::WriteStdin { session_id: id, bytes })
+                            .await?;
+                    }
+                }
+                app.modal = Modal::Orchestrator;
             }
         }
         Modal::PromptEdit { mut label, mut body, editing_body } => {

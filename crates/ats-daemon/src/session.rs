@@ -183,7 +183,7 @@ impl SessionManager {
                 let _ = child.wait();
                 *handle.state.lock().unwrap() = SessionState::Dead;
                 let _ = store.set_session_state(session_id, SessionState::Dead, None);
-                let _ = store.clear_dead_tab_slot(session_id);
+                let _ = store.clear_tab_slot(session_id);
                 let _ = events.send(Event::SessionStateChanged {
                     session_id,
                     state: SessionState::Dead,

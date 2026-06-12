@@ -72,6 +72,11 @@ pub enum Request {
     },
     /// LLM-drafted catch-up note for re-entering a session
     DraftReentry { session_id: i64 },
+    /// Conversational orchestrator with tools: it can register templates,
+    /// spawn sessions, instruct/broadcast, read transcripts, harvest.
+    OrchestratorChat { message: String },
+    /// Clear the orchestrator's conversation history
+    OrchestratorReset,
     ListReviewQueue,
 }
 
@@ -150,6 +155,8 @@ pub enum Event {
         workspace_id: i64,
         status: WorkspaceStatus,
     },
+    /// live progress from an orchestrator chat turn (tool calls, thoughts)
+    OrchestratorProgress { text: String },
 }
 
 /// Anything the daemon writes to a client: a response or a pushed event.

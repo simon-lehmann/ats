@@ -154,6 +154,9 @@ async fn run(
                     Ok(Event::DigestReady { session_id, summary }) => {
                         app.status_line = format!("digest [{session_id}]: {summary}");
                     }
+                    Ok(Event::OrchestratorProgress { text }) => {
+                        app.push_orchestrator_progress(text);
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         anyhow::bail!("daemon connection lost");

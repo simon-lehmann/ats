@@ -1,0 +1,19 @@
+# Copy to ats.toml and adjust. All keys optional — defaults shown.
+
+[daemon]
+workspaces_root = "~/ats/workspaces"
+scrollback_lines = 10000
+idle_threshold_secs = 8
+
+[orchestrator]
+model = "claude-haiku-4-5"
+auto_digest = false           # calm by default
+
+[ui]
+rail_width = 28
+group_a_slots = 5
+group_b_slots = 5
+
+# [keys]
+# spawn = "alt+s"
+# review_queue = "alt+q"

@@ -29,11 +29,14 @@ clicking through all of them.
 
 ATS is built around a few non-negotiable principles:
 
-1. **Pull-based attention.** Nothing animates, flashes, or notifies. A
-   session's state is one dim glyph: `·` working, `○` idle, `●` finished,
-   `!` needs you. You decide when to context-switch — the review queue
-   (`Alt+q`) tells you what's waiting, including the agent's question
-   *verbatim*, read from its transcript.
+1. **Pull-based attention (consensual context-switching).** Nothing animates,
+   flashes, dings, or slides a toast into the corner of your eye. No agent can
+   reach out and grab your focus — every context switch is one you *consented*
+   to. A session's state is one dim glyph: `·` working, `○` idle, `●` finished,
+   `!` needs you. You'll still end the day brain-fried; it'll just be
+   **consensual frying** — you chose each interrupt, not a hundred agents on
+   your behalf. The review queue (`Alt+q`) shows what's waiting, the agent's
+   question read *verbatim* from its transcript.
 2. **Crash-safe sessions.** A daemon owns every agent process. Kill the UI,
    reboot your terminal, attach from a second window — the agents never
    notice. Scrollback survives.

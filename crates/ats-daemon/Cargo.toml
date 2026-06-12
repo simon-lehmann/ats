@@ -16,7 +16,6 @@ tracing-subscriber = { workspace = true }
 portable-pty = { workspace = true }
 vt100 = { workspace = true }
 rusqlite = { workspace = true }
-notify = { workspace = true }
 interprocess = { workspace = true }
 reqwest = { workspace = true }
 

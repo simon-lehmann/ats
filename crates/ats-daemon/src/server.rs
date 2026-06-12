@@ -17,7 +17,7 @@ use interprocess::local_socket::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
 
-use crate::clone::CloneManager;
+use crate::clone::{git_status, CloneManager};
 use crate::session::SessionManager;
 use crate::store::Store;
 
@@ -116,7 +116,17 @@ impl Daemon {
                     .await?;
                 Ok(Response::Template { template })
             }
-            Request::ListWorkspaces => Ok(Response::Workspaces { workspaces: self.store.list_workspaces()? }),
+            Request::ListWorkspaces => {
+                let mut workspaces = self.store.list_workspaces()?;
+                for w in &mut workspaces {
+                    if let Some(git) = git_status(&w.path).await {
+                        w.dirty = Some(git.dirty);
+                        w.ahead = git.ahead;
+                        w.behind = git.behind;
+                    }
+                }
+                Ok(Response::Workspaces { workspaces })
+            }
             Request::SpawnWorkspace { template_id } => {
                 let workspace = self.clones.spawn_workspace(template_id).await?;
                 Ok(Response::Workspace { workspace })
@@ -164,6 +174,10 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::ListPrompts => Ok(Response::Prompts { prompts: self.store.list_prompts()? }),
+            Request::UpsertPrompt { id, label, body, kind } => {
+                self.store.upsert_prompt(id, &label, &body, &kind)?;
+                Ok(Response::Prompts { prompts: self.store.list_prompts()? })
+            }
             Request::UsePrompt { id, session_id } => {
                 let prompt = self
                     .store
@@ -188,6 +202,43 @@ impl Daemon {
                 Err(anyhow!("orchestrator features land in Phase 3"))
             }
         }
+    }
+}
+
+/// Find (and cache) the session's transcript, then classify its tail.
+async fn classify_session(
+    daemon: &Daemon,
+    claude_home: &std::path::Path,
+    session_id: i64,
+) -> crate::transcript::Classification {
+    use crate::transcript;
+    let idle = || transcript::Classification { state: SessionState::Idle, detail: None };
+
+    let path = match daemon.store.session_transcript(session_id) {
+        Ok(Some(p)) => Some(std::path::PathBuf::from(p)),
+        Ok(None) => {
+            let Ok(Some(info)) = daemon.store.get_session(session_id) else {
+                return idle();
+            };
+            let found = transcript::discover_transcript(
+                claude_home,
+                &info.workspace_path,
+                info.created_at,
+            );
+            if let Some(p) = &found {
+                let _ = daemon
+                    .store
+                    .set_session_transcript(session_id, &p.to_string_lossy());
+            }
+            found
+        }
+        Err(_) => None,
+    };
+    match path {
+        Some(p) => tokio::task::spawn_blocking(move || transcript::classify_file(&p))
+            .await
+            .unwrap_or_else(|_| idle()),
+        None => idle(),
     }
 }
 
@@ -271,17 +322,22 @@ pub async fn serve(daemon: Arc<Daemon>, socket_path: &str) -> Result<()> {
         .with_context(|| format!("binding local socket {socket_path}"))?;
     tracing::info!(socket = socket_path, "ats-daemon listening");
 
-    // heartbeat sweep (plan §4.1)
+    // heartbeat sweep (plan §4.1) + transcript classification (plan §4.2):
+    // quiet sessions get classified from their Claude Code JSONL tail;
+    // no transcript → plain idle (graceful degradation).
     {
         let daemon = daemon.clone();
         let period = daemon.config.daemon.idle_threshold_secs.max(1);
         tokio::spawn(async move {
+            let claude_home = crate::transcript::default_claude_home();
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(period.min(2)));
             loop {
                 tick.tick().await;
-                daemon
-                    .sessions
-                    .sweep_idle(daemon.config.daemon.idle_threshold_secs as i64, &daemon.store);
+                let threshold = daemon.config.daemon.idle_threshold_secs as i64;
+                for id in daemon.sessions.quiet_working(threshold) {
+                    let class = classify_session(&daemon, &claude_home, id).await;
+                    daemon.sessions.set_state(id, class.state, class.detail, &daemon.store);
+                }
             }
         });
     }

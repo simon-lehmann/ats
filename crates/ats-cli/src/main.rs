@@ -50,6 +50,36 @@ enum Cmd {
     Destroy { workspace_id: i64 },
     /// Sessions waiting on the developer (finished / needs input / error)
     Queue,
+    /// Notes / plans
+    #[command(subcommand)]
+    Note(NoteCmd),
+    /// Prompt clipboard
+    #[command(subcommand)]
+    Prompt(PromptCmd),
+}
+
+#[derive(Subcommand)]
+enum NoteCmd {
+    /// Add a note (body from arg or stdin with '-')
+    Add { title: String, body: String },
+    List,
+    Finalize { id: i64 },
+    /// Send a note's body to a session's stdin
+    Send { id: i64, session_id: i64 },
+}
+
+#[derive(Subcommand)]
+enum PromptCmd {
+    /// Add a prompt to the clipboard
+    Add {
+        label: String,
+        body: String,
+        #[arg(long, default_value = "clipboard")]
+        kind: String,
+    },
+    List,
+    /// Paste a prompt into a session
+    Use { id: i64, session_id: i64 },
 }
 
 fn glyph(state: SessionState) -> &'static str {
@@ -207,6 +237,67 @@ async fn main() -> Result<()> {
                 print_sessions(&sessions);
             }
         }
+        Cmd::Note(cmd) => match cmd {
+            NoteCmd::Add { title, body } => {
+                let body = if body == "-" {
+                    use std::io::Read;
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    s
+                } else {
+                    body
+                };
+                let resp = client.request(Request::UpsertNote { id: None, title, body }).await?;
+                if let Response::Note { note } = resp {
+                    println!("note {} ({})", note.id, note.state);
+                }
+            }
+            NoteCmd::List => {
+                let resp = client.request(Request::ListNotes).await?;
+                if let Response::Notes { notes } = resp {
+                    if notes.is_empty() {
+                        println!("no notes");
+                    }
+                    for n in notes {
+                        let pin = if n.pinned { "*" } else { " " };
+                        println!("{:>3} {pin} [{:<9}] {}", n.id, n.state, n.title);
+                    }
+                }
+            }
+            NoteCmd::Finalize { id } => {
+                client.request(Request::FinalizeNote { id }).await?;
+                println!("note {id} finalized");
+            }
+            NoteCmd::Send { id, session_id } => {
+                client
+                    .request(Request::SendNoteToSession { note_id: id, session_id })
+                    .await?;
+                println!("note {id} sent to session {session_id}");
+            }
+        },
+        Cmd::Prompt(cmd) => match cmd {
+            PromptCmd::Add { label, body, kind } => {
+                client
+                    .request(Request::UpsertPrompt { id: None, label, body, kind })
+                    .await?;
+                println!("prompt added");
+            }
+            PromptCmd::List => {
+                let resp = client.request(Request::ListPrompts).await?;
+                if let Response::Prompts { prompts } = resp {
+                    if prompts.is_empty() {
+                        println!("no prompts");
+                    }
+                    for p in prompts {
+                        println!("{:>3}  {:<20} ({}x) {}", p.id, p.label, p.use_count, p.kind);
+                    }
+                }
+            }
+            PromptCmd::Use { id, session_id } => {
+                client.request(Request::UsePrompt { id, session_id }).await?;
+                println!("prompt {id} pasted into session {session_id}");
+            }
+        },
     }
     Ok(())
 }

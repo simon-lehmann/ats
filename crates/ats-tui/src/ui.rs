@@ -417,6 +417,8 @@ fn draw_spawn(frame: &mut Frame, app: &App, selected: usize) {
         let marker = if i == selected { "▸" } else { " " };
         lines.push(Line::styled(format!(" {marker} {:<16} {}", t.name, t.path), style));
     }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("  p — planning session (scratch dir, no clone)", DIM));
     let area = centered(frame, 64, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(

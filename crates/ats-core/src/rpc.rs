@@ -22,6 +22,13 @@ pub enum Request {
         tab_slot: Option<u8>,
         kickoff_note_id: Option<i64>,
     },
+    /// Bare agent session in `cwd` (default: the daemon's scratch dir) —
+    /// no workspace clone. For planning/triage alongside real workspaces.
+    SpawnScratchSession {
+        cwd: Option<String>,
+        tab_slot: Option<u8>,
+        kickoff: Option<String>,
+    },
     AttachSession { session_id: i64 },
     DetachSession { session_id: i64 },
     WriteStdin {

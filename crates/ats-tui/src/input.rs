@@ -255,6 +255,20 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         Modal::Spawn { selected } => match key.code {
             KeyCode::Esc => {}
+            // bare planning session, no workspace clone
+            KeyCode::Char('p') => {
+                let client = app.client.clone();
+                app.status_line = "spawning planning session…".into();
+                tokio::spawn(async move {
+                    let _ = client
+                        .request(Request::SpawnScratchSession {
+                            cwd: None,
+                            tab_slot: None,
+                            kickoff: None,
+                        })
+                        .await;
+                });
+            }
             KeyCode::Up => app.modal = Modal::Spawn { selected: selected.saturating_sub(1) },
             KeyCode::Down => {
                 let max = app.templates.len().saturating_sub(1);

@@ -17,7 +17,7 @@ use interprocess::local_socket::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
 
-use crate::clone::CloneManager;
+use crate::clone::{git_status, CloneManager};
 use crate::session::SessionManager;
 use crate::store::Store;
 
@@ -25,6 +25,7 @@ pub struct Daemon {
     pub store: Arc<Store>,
     pub sessions: SessionManager,
     pub clones: CloneManager,
+    pub orchestrator: crate::orchestrator::Orchestrator,
     pub events: broadcast::Sender<Event>,
     pub config: Config,
 }
@@ -39,16 +40,23 @@ impl Daemon {
             PathBuf::from(&config.daemon.workspaces_root),
             data_dir,
         );
-        Self { store, sessions, clones, events, config }
+        let orchestrator = crate::orchestrator::Orchestrator::new(&config.orchestrator);
+        Self { store, sessions, clones, orchestrator, events, config }
     }
 
     /// Spawn workspace + session from a template; the full `Alt+s` flow.
+    /// A kickoff (note body, falling back to the template's preset) is
+    /// written to the agent's stdin once it has had a moment to boot.
     async fn spawn_session(
-        &self,
+        self: &Arc<Self>,
         template_id: i64,
         tab_slot: Option<u8>,
         kickoff_note_id: Option<i64>,
     ) -> Result<Response> {
+        let template = self
+            .store
+            .get_template(template_id)?
+            .ok_or_else(|| anyhow!("no template {template_id}"))?;
         let ws = self.clones.spawn_workspace(template_id).await?;
         let max_slots = self.config.ui.group_a_slots + self.config.ui.group_b_slots;
         let slot = match tab_slot {
@@ -68,6 +76,31 @@ impl Daemon {
         }
         self.store
             .update_workspace(ws.id, None, None, ats_core::state::WorkspaceStatus::Attached)?;
+
+        let kickoff = match kickoff_note_id {
+            Some(note_id) => self.store.get_note(note_id)?.map(|n| (Some(note_id), n.body)),
+            None => template.kickoff_prompt.map(|p| (None, p)),
+        };
+        if let Some((note_id, text)) = kickoff {
+            let daemon = self.clone();
+            tokio::spawn(async move {
+                // let the agent CLI finish booting before typing at it
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let mut bytes = text.into_bytes();
+                bytes.push(b'\r');
+                match daemon.sessions.write_stdin(session_id, &bytes) {
+                    Ok(()) => {
+                        if let Some(note_id) = note_id {
+                            let _ = daemon
+                                .store
+                                .set_note_state(note_id, "claimed", Some(session_id));
+                        }
+                    }
+                    Err(e) => tracing::warn!(session_id, "kickoff send failed: {e:#}"),
+                }
+            });
+        }
+
         let session = self
             .store
             .get_session(session_id)?
@@ -75,7 +108,7 @@ impl Daemon {
         Ok(Response::Session { session })
     }
 
-    async fn dispatch(&self, req: Request, attached: &Mutex<HashSet<i64>>) -> Result<Response> {
+    async fn dispatch(self: &Arc<Self>, req: Request, attached: &Mutex<HashSet<i64>>) -> Result<Response> {
         match req {
             Request::ListSessions => Ok(Response::Sessions { sessions: self.store.list_sessions()? }),
             Request::SpawnSession { template_id, tab_slot, kickoff_note_id } => {
@@ -109,14 +142,29 @@ impl Daemon {
                 data: self.sessions.scrollback(session_id)?,
             }),
             Request::ListTemplates => Ok(Response::Templates { templates: self.store.list_templates()? }),
-            Request::RegisterTemplate { name, path, setup_cmd } => {
+            Request::RegisterTemplate { name, path, setup_cmd, kickoff_prompt } => {
                 let template = self
                     .clones
-                    .register_template(&name, &path, setup_cmd.as_deref())
+                    .register_template(
+                        &name,
+                        &path,
+                        setup_cmd.as_deref(),
+                        kickoff_prompt.as_deref(),
+                    )
                     .await?;
                 Ok(Response::Template { template })
             }
-            Request::ListWorkspaces => Ok(Response::Workspaces { workspaces: self.store.list_workspaces()? }),
+            Request::ListWorkspaces => {
+                let mut workspaces = self.store.list_workspaces()?;
+                for w in &mut workspaces {
+                    if let Some(git) = git_status(&w.path).await {
+                        w.dirty = Some(git.dirty);
+                        w.ahead = git.ahead;
+                        w.behind = git.behind;
+                    }
+                }
+                Ok(Response::Workspaces { workspaces })
+            }
             Request::SpawnWorkspace { template_id } => {
                 let workspace = self.clones.spawn_workspace(template_id).await?;
                 Ok(Response::Workspace { workspace })
@@ -164,6 +212,10 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::ListPrompts => Ok(Response::Prompts { prompts: self.store.list_prompts()? }),
+            Request::UpsertPrompt { id, label, body, kind } => {
+                self.store.upsert_prompt(id, &label, &body, &kind)?;
+                Ok(Response::Prompts { prompts: self.store.list_prompts()? })
+            }
             Request::UsePrompt { id, session_id } => {
                 let prompt = self
                     .store
@@ -184,10 +236,68 @@ impl Daemon {
                     .collect();
                 Ok(Response::Sessions { sessions })
             }
-            Request::SummarizeSession { .. } | Request::AskOrchestrator { .. } => {
-                Err(anyhow!("orchestrator features land in Phase 3"))
+            Request::SummarizeSession { session_id, force_llm } => {
+                let (summary, _source) = self
+                    .orchestrator
+                    .digest(&self.store, session_id, force_llm)
+                    .await?;
+                let _ = self.events.send(Event::DigestReady {
+                    session_id,
+                    summary: summary.clone(),
+                });
+                Ok(Response::Digest { session_id, summary })
+            }
+            Request::AskOrchestrator { question, session_ids } => {
+                let ids = if session_ids.is_empty() {
+                    self.store.list_sessions()?.iter().map(|s| s.id).collect()
+                } else {
+                    session_ids
+                };
+                let text = self.orchestrator.ask(&self.store, &question, &ids).await?;
+                Ok(Response::Answer { text })
+            }
+            Request::DraftReentry { session_id } => {
+                let note = self.orchestrator.draft_reentry(&self.store, session_id).await?;
+                Ok(Response::Note { note })
             }
         }
+    }
+}
+
+/// Find (and cache) the session's transcript, then classify its tail.
+async fn classify_session(
+    daemon: &Daemon,
+    claude_home: &std::path::Path,
+    session_id: i64,
+) -> crate::transcript::Classification {
+    use crate::transcript;
+    let idle = || transcript::Classification { state: SessionState::Idle, detail: None };
+
+    let path = match daemon.store.session_transcript(session_id) {
+        Ok(Some(p)) => Some(std::path::PathBuf::from(p)),
+        Ok(None) => {
+            let Ok(Some(info)) = daemon.store.get_session(session_id) else {
+                return idle();
+            };
+            let found = transcript::discover_transcript(
+                claude_home,
+                &info.workspace_path,
+                info.created_at,
+            );
+            if let Some(p) = &found {
+                let _ = daemon
+                    .store
+                    .set_session_transcript(session_id, &p.to_string_lossy());
+            }
+            found
+        }
+        Err(_) => None,
+    };
+    match path {
+        Some(p) => tokio::task::spawn_blocking(move || transcript::classify_file(&p))
+            .await
+            .unwrap_or_else(|_| idle()),
+        None => idle(),
     }
 }
 
@@ -271,17 +381,42 @@ pub async fn serve(daemon: Arc<Daemon>, socket_path: &str) -> Result<()> {
         .with_context(|| format!("binding local socket {socket_path}"))?;
     tracing::info!(socket = socket_path, "ats-daemon listening");
 
-    // heartbeat sweep (plan §4.1)
+    // heartbeat sweep (plan §4.1) + transcript classification (plan §4.2):
+    // quiet sessions get classified from their Claude Code JSONL tail;
+    // no transcript → plain idle (graceful degradation).
     {
         let daemon = daemon.clone();
         let period = daemon.config.daemon.idle_threshold_secs.max(1);
         tokio::spawn(async move {
+            let claude_home = crate::transcript::default_claude_home();
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(period.min(2)));
             loop {
                 tick.tick().await;
-                daemon
-                    .sessions
-                    .sweep_idle(daemon.config.daemon.idle_threshold_secs as i64, &daemon.store);
+                let threshold = daemon.config.daemon.idle_threshold_secs as i64;
+                for id in daemon.sessions.quiet_working(threshold) {
+                    let class = classify_session(&daemon, &claude_home, id).await;
+                    let finished = class.state == SessionState::Finished;
+                    let long_report = class
+                        .detail
+                        .as_deref()
+                        .map(|d| d.len() >= 100)
+                        .unwrap_or(false);
+                    daemon.sessions.set_state(id, class.state, class.detail, &daemon.store);
+                    // opt-in auto-digest on long finished reports (plan §4.3)
+                    if finished && long_report && daemon.config.orchestrator.auto_digest {
+                        let daemon = daemon.clone();
+                        tokio::spawn(async move {
+                            match daemon.orchestrator.digest(&daemon.store, id, false).await {
+                                Ok((summary, _)) => {
+                                    let _ = daemon
+                                        .events
+                                        .send(Event::DigestReady { session_id: id, summary });
+                                }
+                                Err(e) => tracing::warn!(session = id, "auto-digest: {e:#}"),
+                            }
+                        });
+                    }
+                }
             }
         });
     }

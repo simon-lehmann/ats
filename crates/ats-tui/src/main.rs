@@ -80,6 +80,23 @@ async fn run(
     config: &Config,
 ) -> Result<()> {
     let mut app = App::new(client.clone(), config.ui.group_a_slots, config.ui.group_b_slots);
+    app.template_colors = config.ui.template_colors.clone();
+    // --group a|b: single-group client for a second monitor/window
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--group") {
+        match args.get(i + 1).map(String::as_str) {
+            Some("a") => {
+                app.solo = true;
+                app.focus = app::Focus::GroupA;
+            }
+            Some("b") => {
+                app.solo = true;
+                app.focus = app::Focus::GroupB;
+            }
+            other => anyhow::bail!("--group expects 'a' or 'b', got {other:?}"),
+        }
+    }
+    let mut async_rx = app.async_rx.take().expect("fresh App has the receiver");
     app.refresh().await?;
 
     let mut events = client.subscribe_events();
@@ -134,11 +151,18 @@ async fn run(
                     Ok(Event::WorkspaceStatusChanged { .. }) => {
                         let _ = app.refresh().await;
                     }
-                    Ok(_) => {}
+                    Ok(Event::DigestReady { session_id, summary }) => {
+                        app.status_line = format!("digest [{session_id}]: {summary}");
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         anyhow::bail!("daemon connection lost");
                     }
+                }
+            }
+            msg = async_rx.recv() => {
+                if let Some(msg) = msg {
+                    app.apply_async(msg);
                 }
             }
             _ = tick.tick() => {

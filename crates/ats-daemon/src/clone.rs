@@ -15,6 +15,37 @@ use tokio::sync::broadcast;
 
 use crate::store::Store;
 
+pub struct GitStatus {
+    pub dirty: u32,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+}
+
+/// `git status --porcelain=v2 --branch`: dirty entry count plus
+/// ahead/behind when an upstream exists. None if the path isn't a repo.
+pub async fn git_status(path: &str) -> Option<GitStatus> {
+    let out = Command::new("git")
+        .args(["-C", path, "status", "--porcelain=v2", "--branch"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut st = GitStatus { dirty: 0, ahead: None, behind: None };
+    for line in text.lines() {
+        if let Some(ab) = line.strip_prefix("# branch.ab ") {
+            let mut parts = ab.split_whitespace();
+            st.ahead = parts.next().and_then(|s| s.trim_start_matches('+').parse().ok());
+            st.behind = parts.next().and_then(|s| s.trim_start_matches('-').parse().ok());
+        } else if !line.starts_with('#') {
+            st.dirty += 1;
+        }
+    }
+    Some(st)
+}
+
 pub struct CloneManager {
     store: Arc<Store>,
     events: broadcast::Sender<Event>,
@@ -90,14 +121,20 @@ impl CloneManager {
         name: &str,
         path: &str,
         setup_cmd: Option<&str>,
+        kickoff_prompt: Option<&str>,
     ) -> Result<TemplateInfo> {
         let p = Path::new(path);
         if !p.join(".git").exists() {
             bail!("{path} is not a git repository (no .git)");
         }
         let origin = git(p, &["remote", "get-url", "origin"]).await.ok();
-        self.store
-            .insert_template(name, path, origin.as_deref().map(str::trim), setup_cmd)
+        self.store.insert_template(
+            name,
+            path,
+            origin.as_deref().map(str::trim),
+            setup_cmd,
+            kickoff_prompt,
+        )
     }
 
     pub async fn spawn_workspace(&self, template_id: i64) -> Result<WorkspaceInfo> {
@@ -228,7 +265,7 @@ mod tests {
 
         let m = mgr(tmp.path());
         let t = m
-            .register_template("demo", &template_dir.to_string_lossy(), None)
+            .register_template("demo", &template_dir.to_string_lossy(), None, None)
             .await
             .unwrap();
         let ws = m.spawn_workspace(t.id).await.unwrap();
@@ -249,13 +286,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_status_reports_dirty_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("r");
+        make_template_repo(&repo).await;
+        let path = repo.to_string_lossy();
+        let st = git_status(&path).await.unwrap();
+        assert_eq!(st.dirty, 0);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        std::fs::write(repo.join("b.txt"), "y").unwrap();
+        let st = git_status(&path).await.unwrap();
+        assert_eq!(st.dirty, 2);
+        // not a repo → None
+        assert!(git_status("/tmp").await.is_none());
+    }
+
+    #[tokio::test]
     async fn register_rejects_non_git_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let m = mgr(tmp.path());
         let plain = tmp.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         assert!(m
-            .register_template("x", &plain.to_string_lossy(), None)
+            .register_template("x", &plain.to_string_lossy(), None, None)
             .await
             .is_err());
     }
@@ -267,7 +320,7 @@ mod tests {
         make_template_repo(&template_dir).await;
         let m = mgr(tmp.path());
         let t = m
-            .register_template("demo", &template_dir.to_string_lossy(), None)
+            .register_template("demo", &template_dir.to_string_lossy(), None, None)
             .await
             .unwrap();
         let ws = m.spawn_workspace(t.id).await.unwrap();

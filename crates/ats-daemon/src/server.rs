@@ -45,12 +45,18 @@ impl Daemon {
     }
 
     /// Spawn workspace + session from a template; the full `Alt+s` flow.
+    /// A kickoff (note body, falling back to the template's preset) is
+    /// written to the agent's stdin once it has had a moment to boot.
     async fn spawn_session(
-        &self,
+        self: &Arc<Self>,
         template_id: i64,
         tab_slot: Option<u8>,
         kickoff_note_id: Option<i64>,
     ) -> Result<Response> {
+        let template = self
+            .store
+            .get_template(template_id)?
+            .ok_or_else(|| anyhow!("no template {template_id}"))?;
         let ws = self.clones.spawn_workspace(template_id).await?;
         let max_slots = self.config.ui.group_a_slots + self.config.ui.group_b_slots;
         let slot = match tab_slot {
@@ -70,6 +76,31 @@ impl Daemon {
         }
         self.store
             .update_workspace(ws.id, None, None, ats_core::state::WorkspaceStatus::Attached)?;
+
+        let kickoff = match kickoff_note_id {
+            Some(note_id) => self.store.get_note(note_id)?.map(|n| (Some(note_id), n.body)),
+            None => template.kickoff_prompt.map(|p| (None, p)),
+        };
+        if let Some((note_id, text)) = kickoff {
+            let daemon = self.clone();
+            tokio::spawn(async move {
+                // let the agent CLI finish booting before typing at it
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let mut bytes = text.into_bytes();
+                bytes.push(b'\r');
+                match daemon.sessions.write_stdin(session_id, &bytes) {
+                    Ok(()) => {
+                        if let Some(note_id) = note_id {
+                            let _ = daemon
+                                .store
+                                .set_note_state(note_id, "claimed", Some(session_id));
+                        }
+                    }
+                    Err(e) => tracing::warn!(session_id, "kickoff send failed: {e:#}"),
+                }
+            });
+        }
+
         let session = self
             .store
             .get_session(session_id)?
@@ -77,7 +108,7 @@ impl Daemon {
         Ok(Response::Session { session })
     }
 
-    async fn dispatch(&self, req: Request, attached: &Mutex<HashSet<i64>>) -> Result<Response> {
+    async fn dispatch(self: &Arc<Self>, req: Request, attached: &Mutex<HashSet<i64>>) -> Result<Response> {
         match req {
             Request::ListSessions => Ok(Response::Sessions { sessions: self.store.list_sessions()? }),
             Request::SpawnSession { template_id, tab_slot, kickoff_note_id } => {
@@ -111,10 +142,15 @@ impl Daemon {
                 data: self.sessions.scrollback(session_id)?,
             }),
             Request::ListTemplates => Ok(Response::Templates { templates: self.store.list_templates()? }),
-            Request::RegisterTemplate { name, path, setup_cmd } => {
+            Request::RegisterTemplate { name, path, setup_cmd, kickoff_prompt } => {
                 let template = self
                     .clones
-                    .register_template(&name, &path, setup_cmd.as_deref())
+                    .register_template(
+                        &name,
+                        &path,
+                        setup_cmd.as_deref(),
+                        kickoff_prompt.as_deref(),
+                    )
                     .await?;
                 Ok(Response::Template { template })
             }

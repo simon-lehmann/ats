@@ -80,6 +80,22 @@ async fn run(
     config: &Config,
 ) -> Result<()> {
     let mut app = App::new(client.clone(), config.ui.group_a_slots, config.ui.group_b_slots);
+    app.template_colors = config.ui.template_colors.clone();
+    // --group a|b: single-group client for a second monitor/window
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--group") {
+        match args.get(i + 1).map(String::as_str) {
+            Some("a") => {
+                app.solo = true;
+                app.focus = app::Focus::GroupA;
+            }
+            Some("b") => {
+                app.solo = true;
+                app.focus = app::Focus::GroupB;
+            }
+            other => anyhow::bail!("--group expects 'a' or 'b', got {other:?}"),
+        }
+    }
     let mut async_rx = app.async_rx.take().expect("fresh App has the receiver");
     app.refresh().await?;
 

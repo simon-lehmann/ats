@@ -29,6 +29,9 @@ enum Cmd {
         path: String,
         #[arg(long)]
         setup_cmd: Option<String>,
+        /// kickoff prompt sent to every new session in this template
+        #[arg(long)]
+        kickoff: Option<String>,
     },
     /// Spawn workspace + session from a template (name or id)
     Spawn {
@@ -50,6 +53,18 @@ enum Cmd {
     Destroy { workspace_id: i64 },
     /// Sessions waiting on the developer (finished / needs input / error)
     Queue,
+    /// Block until a session reaches a state (for scripts / agent hooks)
+    Wait {
+        session_id: i64,
+        /// working|idle|finished|needs_input|error|dead
+        #[arg(long)]
+        state: String,
+        /// give up after N seconds (default: wait forever)
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+    /// Stream daemon events to stdout as JSON lines (Ctrl+C to stop)
+    Events,
     /// One-line digest of a session's final report
     Digest {
         session_id: i64,
@@ -172,7 +187,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Register { name, path, setup_cmd } => {
+        Cmd::Register { name, path, setup_cmd, kickoff } => {
             let abs = std::fs::canonicalize(&path)
                 .map_err(|e| anyhow!("resolving {path}: {e}"))?;
             let resp = client
@@ -180,6 +195,7 @@ async fn main() -> Result<()> {
                     name,
                     path: abs.to_string_lossy().into_owned(),
                     setup_cmd,
+                    kickoff_prompt: kickoff,
                 })
                 .await?;
             if let Response::Template { template } = resp {
@@ -249,6 +265,68 @@ async fn main() -> Result<()> {
             let resp = client.request(Request::ListReviewQueue).await?;
             if let Response::Sessions { sessions } = resp {
                 print_sessions(&sessions);
+            }
+        }
+        Cmd::Wait { session_id, state, timeout } => {
+            let want = match state.as_str() {
+                "working" => SessionState::Working,
+                "idle" => SessionState::Idle,
+                "finished" => SessionState::Finished,
+                "needs_input" => SessionState::NeedsInput,
+                "error" => SessionState::Error,
+                "dead" => SessionState::Dead,
+                other => bail!("unknown state '{other}'"),
+            };
+            // subscribe first so no transition is missed, then check current
+            let mut events = client.subscribe_events();
+            let resp = client.request(Request::ListSessions).await?;
+            if let Response::Sessions { sessions } = resp {
+                if let Some(s) = sessions.iter().find(|s| s.id == session_id) {
+                    if s.state == want {
+                        println!("{}", s.state_detail.as_deref().unwrap_or(""));
+                        return Ok(());
+                    }
+                } else {
+                    bail!("no session {session_id}");
+                }
+            }
+            let deadline = timeout.map(|t| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(t)
+            });
+            loop {
+                let ev = match deadline {
+                    Some(d) => tokio::time::timeout_at(d, events.recv())
+                        .await
+                        .map_err(|_| anyhow!("timed out waiting for {state}"))?,
+                    None => events.recv().await,
+                };
+                match ev {
+                    Ok(ats_core::rpc::Event::SessionStateChanged {
+                        session_id: sid,
+                        state: got,
+                        detail,
+                    }) if sid == session_id && got == want => {
+                        println!("{}", detail.as_deref().unwrap_or(""));
+                        return Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(_) => bail!("daemon connection lost"),
+                }
+            }
+        }
+        Cmd::Events => {
+            let mut events = client.subscribe_events();
+            loop {
+                match events.recv().await {
+                    Ok(ev) => {
+                        // PTY output is high-volume noise for scripting
+                        if matches!(ev, ats_core::rpc::Event::PtyOutput { .. }) {
+                            continue;
+                        }
+                        println!("{}", serde_json::to_string(&ev)?);
+                    }
+                    Err(_) => bail!("daemon connection lost"),
+                }
             }
         }
         Cmd::Digest { session_id, llm } => {

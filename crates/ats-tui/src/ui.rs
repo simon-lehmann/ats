@@ -38,13 +38,21 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
 
     draw_rail(frame, app, cols[0]);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(cols[1]);
-
-    let a_inner = draw_group(frame, app, rows[0], Focus::GroupA);
-    let b_inner = draw_group(frame, app, rows[1], Focus::GroupB);
+    let (a_inner, b_inner) = if app.solo {
+        // second-monitor mode: one group, full height
+        let group = if app.focus == Focus::GroupB { Focus::GroupB } else { Focus::GroupA };
+        let inner = draw_group(frame, app, cols[1], group);
+        (inner, inner)
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(cols[1]);
+        (
+            draw_group(frame, app, rows[0], Focus::GroupA),
+            draw_group(frame, app, rows[1], Focus::GroupB),
+        )
+    };
 
     match &app.modal {
         Modal::Help => draw_help(frame),
@@ -58,6 +66,7 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
         Modal::Orchestrator { question, answer, busy } => {
             draw_orchestrator(frame, question, answer.as_deref(), *busy)
         }
+        Modal::Diff { title, lines, scroll } => draw_diff(frame, title, lines, *scroll),
         Modal::PromptEdit { label, body, editing_body } => {
             draw_editor(frame, "prompt — Tab label/body, Ctrl+s save", label, body, *editing_body)
         }
@@ -174,10 +183,11 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
         (app.a_slots + 1, app.b_slots, app.active_b)
     };
 
-    // tab bar: number + short name + glyph, dim
+    // tab bar: number + short name + glyph, dim; per-template tint stays calm
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for slot in first..first + count {
-        let label = match app.session_in_slot(slot) {
+        let session = app.session_in_slot(slot);
+        let label = match session {
             Some(s) => {
                 let mut name = s.title.clone();
                 name.truncate(10);
@@ -185,10 +195,13 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
             }
             None => format!("{} —", slot_key_label(slot)),
         };
+        let tint = session
+            .and_then(|s| app.template_colors.get(&s.template_name))
+            .and_then(|name| parse_color(name));
         let style = if slot == active {
             if app.focus == group { ACTIVE } else { NORMAL }
         } else {
-            DIM
+            tint.map(|c| Style::new().fg(c)).unwrap_or(DIM)
         };
         spans.push(Span::styled(format!(" {label} "), style));
         spans.push(Span::styled("│", DIM));
@@ -232,6 +245,64 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
 /// Map a tab slot to the key that reaches it (slot 10 = key 0).
 fn slot_key_label(slot: u8) -> String {
     if slot == 10 { "0".into() } else { slot.to_string() }
+}
+
+/// Named or `#rrggbb` colors for `[ui.template_colors]`.
+fn parse_color(name: &str) -> Option<Color> {
+    let n = name.trim().to_lowercase();
+    if let Some(hex) = n.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color::Rgb(r, g, b));
+        }
+        return None;
+    }
+    Some(match n.as_str() {
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "gray" | "grey" => Color::Gray,
+        "darkgray" | "darkgrey" => Color::DarkGray,
+        "white" => Color::White,
+        _ => return None,
+    })
+}
+
+fn draw_diff(frame: &mut Frame, title: &str, lines: &[String], scroll: usize) {
+    let area = frame.area();
+    let w = area.width.saturating_sub(6).min(110);
+    let h = area.height.saturating_sub(4);
+    let view = centered(frame, w, h);
+    let visible = (h as usize).saturating_sub(2);
+
+    let mut rendered: Vec<Line> = Vec::new();
+    for l in lines.iter().skip(scroll).take(visible) {
+        let style = if l.starts_with('+') && !l.starts_with("+++") {
+            Style::new().fg(Color::Green)
+        } else if l.starts_with('-') && !l.starts_with("---") {
+            Style::new().fg(Color::Red)
+        } else if l.starts_with("@@") {
+            Style::new().fg(Color::Cyan)
+        } else if l.starts_with("diff ") || l.starts_with("index ") {
+            ACTIVE
+        } else {
+            NORMAL
+        };
+        let mut text = l.clone();
+        text.truncate(w.saturating_sub(2) as usize);
+        rendered.push(Line::styled(text, style));
+    }
+    if rendered.is_empty() {
+        rendered.push(Line::styled("  (no changes against base)", DIM));
+    }
+    let pos = format!(" {title} — {}/{} (↑↓ PgUp/PgDn, Esc) ", scroll, lines.len());
+    frame.render_widget(Clear, view);
+    frame.render_widget(Paragraph::new(rendered).block(modal_block(&pos)), view);
 }
 
 fn vt_color(c: vt100::Color) -> Color {
@@ -315,6 +386,7 @@ fn draw_help(frame: &mut Frame) {
         ("Alt+p", "prompt palette (type to filter, Enter paste)"),
         ("Alt+d", "digest the active session (one line)"),
         ("Alt+o", "orchestrator: ask across all sessions"),
+        ("Alt+h", "harvest active workspace → diff viewer"),
         ("Alt+Esc", "raw mode: forward all keys to the terminal"),
         ("Alt+x", "detach UI (daemon and agents keep running)"),
         ("F1 / Esc", "this help / close"),

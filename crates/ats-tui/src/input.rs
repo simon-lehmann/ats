@@ -131,6 +131,42 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.modal = Modal::Palette { query: String::new(), selected: 0 };
                 return Ok(());
             }
+            // harvest the active session's workspace → diff viewer
+            KeyCode::Char('h') => {
+                if let Some(s) = app
+                    .sessions
+                    .iter()
+                    .find(|s| Some(s.id) == app.active_session_id())
+                {
+                    let workspace_id = s.workspace_id;
+                    let title = s.title.clone();
+                    let client = app.client.clone();
+                    let tx = app.async_tx.clone();
+                    app.status_line = format!("harvesting {title}…");
+                    tokio::spawn(async move {
+                        let msg = match client
+                            .request(Request::HarvestWorkspace { id: workspace_id })
+                            .await
+                        {
+                            Ok(ats_core::rpc::Response::Harvest { patch_path, .. }) => {
+                                match tokio::fs::read_to_string(&patch_path).await {
+                                    Ok(content) => crate::app::AsyncMsg::Diff {
+                                        title: format!("{title} ({patch_path})"),
+                                        content,
+                                    },
+                                    Err(e) => crate::app::AsyncMsg::Status(format!(
+                                        "harvest: cannot read {patch_path}: {e}"
+                                    )),
+                                }
+                            }
+                            Ok(_) => crate::app::AsyncMsg::Status("harvest: unexpected response".into()),
+                            Err(e) => crate::app::AsyncMsg::Status(format!("harvest: {e:#}")),
+                        };
+                        let _ = tx.send(msg);
+                    });
+                }
+                return Ok(());
+            }
             KeyCode::Char('o') => {
                 app.modal = Modal::Orchestrator {
                     question: String::new(),
@@ -361,6 +397,28 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
             } else {
                 edit_text(&mut query, &key);
                 app.modal = Modal::Palette { query, selected: 0 };
+            }
+        }
+        Modal::Diff { title, lines, scroll } => {
+            let page = 20usize;
+            let max = lines.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                KeyCode::Up => {
+                    app.modal = Modal::Diff { title, lines, scroll: scroll.saturating_sub(1) }
+                }
+                KeyCode::Down => {
+                    app.modal = Modal::Diff { title, lines, scroll: (scroll + 1).min(max) }
+                }
+                KeyCode::PageUp => {
+                    app.modal = Modal::Diff { title, lines, scroll: scroll.saturating_sub(page) }
+                }
+                KeyCode::PageDown => {
+                    app.modal = Modal::Diff { title, lines, scroll: (scroll + page).min(max) }
+                }
+                KeyCode::Home => app.modal = Modal::Diff { title, lines, scroll: 0 },
+                KeyCode::End => app.modal = Modal::Diff { title, lines, scroll: max },
+                _ => app.modal = Modal::Diff { title, lines, scroll },
             }
         }
         Modal::Orchestrator { mut question, answer, busy } => {

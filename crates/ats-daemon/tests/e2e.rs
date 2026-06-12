@@ -74,6 +74,7 @@ async fn full_spawn_flow_over_socket() {
             name: "demo".into(),
             path: template_dir.to_string_lossy().into_owned(),
             setup_cmd: None,
+            kickoff_prompt: None,
         })
         .await
         .unwrap();
@@ -182,6 +183,7 @@ async fn quiet_session_with_question_transcript_becomes_needs_input() {
             name: "demo".into(),
             path: template_dir.to_string_lossy().into_owned(),
             setup_cmd: None,
+            kickoff_prompt: None,
         })
         .await
         .unwrap();
@@ -309,6 +311,7 @@ async fn orchestrator_digest_ask_and_reentry() {
             name: "demo".into(),
             path: template_dir.to_string_lossy().into_owned(),
             setup_cmd: None,
+            kickoff_prompt: None,
         })
         .await
         .unwrap();
@@ -377,6 +380,75 @@ async fn orchestrator_digest_ask_and_reentry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn template_kickoff_prompt_reaches_the_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_str = tmp.path().join("ats-kick.sock").to_string_lossy().into_owned();
+    let template_dir = tmp.path().join("template");
+    make_template(&template_dir).await;
+
+    let mut config = Config::default();
+    config.daemon.workspaces_root =
+        tmp.path().join("workspaces").to_string_lossy().into_owned();
+    // cat echoes the kickoff back into the scrollback
+    config.daemon.session_cmd = "cat".into();
+    config.daemon.idle_threshold_secs = 600;
+
+    let store = Arc::new(Store::open(&tmp.path().join("ats.db")).unwrap());
+    let daemon = Arc::new(server::Daemon::new(config, store, tmp.path().join("data")));
+    let server_handle = tokio::spawn({
+        let daemon = daemon.clone();
+        let s = socket_str.clone();
+        async move { server::serve(daemon, &s).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = Client::connect(&socket_str).await.unwrap();
+    let resp = client
+        .request(Request::RegisterTemplate {
+            name: "demo".into(),
+            path: template_dir.to_string_lossy().into_owned(),
+            setup_cmd: None,
+            kickoff_prompt: Some("kickoff: implement the parser".into()),
+        })
+        .await
+        .unwrap();
+    let Response::Template { template } = resp else { panic!() };
+    assert_eq!(template.kickoff_prompt.as_deref(), Some("kickoff: implement the parser"));
+
+    let resp = client
+        .request(Request::SpawnSession {
+            template_id: template.id,
+            tab_slot: None,
+            kickoff_note_id: None,
+        })
+        .await
+        .unwrap();
+    let Response::Session { session } = resp else { panic!() };
+
+    // kickoff is sent ~3s after spawn; poll the scrollback
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "kickoff never reached the agent"
+        );
+        let resp = client
+            .request(Request::GetScrollback { session_id: session.id })
+            .await
+            .unwrap();
+        if let Response::Scrollback { data, .. } = resp {
+            if String::from_utf8_lossy(&data).contains("kickoff: implement the parser") {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    let _ = client.request(Request::KillSession { session_id: session.id }).await;
+    server_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn idle_heartbeat_fires() {
     let tmp = tempfile::tempdir().unwrap();
     let socket_str = tmp.path().join("ats-idle.sock").to_string_lossy().into_owned();
@@ -404,6 +476,7 @@ async fn idle_heartbeat_fires() {
             name: "demo".into(),
             path: template_dir.to_string_lossy().into_owned(),
             setup_cmd: None,
+            kickoff_prompt: None,
         })
         .await
         .unwrap();

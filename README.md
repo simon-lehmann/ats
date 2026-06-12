@@ -1,6 +1,6 @@
 # ATS — Agent Terminal Suite
 
-**Run ten coding agents without losing your mind.**
+**Run a hundred coding agents without losing your mind.**
 
 ATS is a terminal workbench for orchestrating many concurrent [Claude Code](https://claude.com/claude-code)
 sessions. A daemon owns the agents; a calm TUI lets you move between them;
@@ -8,10 +8,10 @@ an orchestrator (itself an agent) does the busywork of setting up, assigning,
 and checking on the fleet.
 
 ```
-┌──── rail ─────────────┬─────── group A:  1 api-core ·  2 api-core ·  3 web !───┐
+┌──── rail ─────────────┬─────── group A:  1 demo-app ·  2 demo-app ·  3 web !───┐
 │ ▾ WORKSPACES          │                                                        │
-│   api-core-1  ~3      │   $ claude                                             │
-│   api-core-2  clean   │   ⏺ Refactoring the session module…                    │
+│   demo-app-1  ~3      │   $ claude                                             │
+│   demo-app-2  clean   │   ⏺ Refactoring the session module…                    │
 │ ▾ REVIEW QUEUE (2)    │   ⏺ Running cargo test…                                │
 │   3 ! keep legacy api?│                                                        │
 │   7 ● tests green, PR ├─────── group B:  6 web-app ·  7 docs ●  8 — ──────────┤
@@ -22,7 +22,7 @@ and checking on the fleet.
 
 ## The idea
 
-Working with one coding agent is a conversation. Working with ten is an
+Working with one coding agent is a conversation. Working with a hundred is an
 attention-management problem: every session wants to interrupt you, every
 terminal looks the same, and figuring out *which one actually needs you* means
 clicking through all of them.
@@ -40,8 +40,9 @@ ATS is built around a few non-negotiable principles:
 3. **Cheap workspaces.** Register a template (a blessed, setup-complete
    clone of your repo) once; spawning an agent-ready copy on its own branch
    takes seconds (`cp --reflink` / robocopy, no network).
-4. **Keyboard-first.** Every action is ≤2 keystrokes. Two tab groups of five
-   sessions, `Alt+1..0` to jump anywhere.
+4. **Keyboard-first.** Every action is ≤2 keystrokes. Your active set sits in
+   two tab groups (`Alt+1..0`, `Alt+←/→` to move); the rail, review queue, and
+   orchestrator marshal the rest of the fleet — you never watch them all at once.
 
 ## The orchestrator
 
@@ -50,7 +51,7 @@ drives the daemon through ATS's tools (exposed as an MCP server). Instead of
 doing setup and coordination by hand, you talk to it:
 
 ```
-❯ register ~/repos/api-core as api-core, spawn a planning session,
+❯ register ~/repos/demo-app as demo-app, spawn a planning session,
   and have it break docs/TODO.md into independent tasks
 ❯ turn that plan into finalized notes and spawn a session per note
 ❯ tell every working session to commit and report a one-line status
@@ -84,14 +85,14 @@ ats-tui                                  # auto-starts the daemon
 # or do it by hand: Alt+s → pick template → agent in the next free tab. F1 = help.
 ```
 
-Prefer to register manually? `ats register api-core ~/repos/api-core` blesses a
+Prefer to register manually? `ats register demo-app ~/repos/demo-app` blesses a
 setup-complete local clone as a template. To wire the orchestrator's tools into
 Claude Code yourself: `ats mcp register`.
 
 Headless / scripting:
 
 ```sh
-ats spawn api-core            # workspace + session without the TUI
+ats spawn demo-app            # workspace + session without the TUI
 ats status                    # all sessions + workspaces at a glance
 ats wait 3 --state finished   # block until session 3 reports back
 ats events                    # daemon lifecycle as JSON lines
@@ -118,7 +119,9 @@ ats scratch --kickoff "review the open PRs and summarize"
 | `F1` | help |
 
 All remappable conventions aside, the terminal pane is a *real* terminal:
-Claude Code's own UI, colors, and prompts work inside it.
+Claude Code's own UI, colors, and prompts work inside it — and `/exit`-ing the
+agent drops you to a shell prompt in that pane, not a dead session. The pane
+lives until the shell does.
 
 ## Architecture
 
@@ -132,7 +135,7 @@ ats-cli ─┼─ JSON-RPC over local ┼─ CloneManager     templates → work
 ```
 
 - PTY output streams only for *attached* (visible) sessions; background
-  sessions write to a daemon-side ring buffer. Ten agents stay cheap.
+  sessions write to a daemon-side ring buffer, so a fleet of hundreds stays cheap.
 - Status beyond the heartbeat comes from Claude Code's own transcript
   (`~/.claude/projects/<cwd>/*.jsonl`): a trailing question → `needs_input`
   with the question as the detail line; a final report → `finished` with its
@@ -162,17 +165,16 @@ auto_digest = false             # calm by default
 group_a_slots = 5
 group_b_slots = 5
 [ui.template_colors]            # calm per-template tab tinting
-api-core = "cyan"
+demo-app = "cyan"
 ```
 
 ## Status
 
 Early but complete: all four phases of the original design are implemented
-and tested (38 tests, including socket-level end-to-end runs with fake
-agents and a scripted Anthropic API). Built and verified on Linux
-(aarch64); Windows (ConPTY via `portable-pty`, named pipes via
-`interprocess`) is the intended primary target but hasn't had hands-on
-testing yet. Expect rough edges; issues welcome.
+and tested, including cross-platform socket-level end-to-end runs with fake
+agents. Built and tested on both Linux and Windows (ConPTY via `portable-pty`,
+named pipes via `interprocess`). Scaling the live view past two tab groups to
+truly hundreds-on-screen is the next frontier. Expect rough edges; issues welcome.
 
 ## License
 

@@ -68,7 +68,7 @@ pub struct UiConfig {
     pub group_a_slots: u8,
     pub group_b_slots: u8,
     /// calm per-template tab tinting: template name → color name
-    /// (e.g. `api-core = "cyan"`); unknown names fall back to the default
+    /// (e.g. `demo-app = "cyan"`); unknown names fall back to the default
     pub template_colors: std::collections::HashMap<String, String>,
 }
 

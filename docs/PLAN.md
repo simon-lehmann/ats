@@ -226,7 +226,7 @@ enum Event {
 ```
 ┌──── rail (24-30 cols) ────┬──────── tab group A: 1 2 3 4 5 ────────┐
 │ ▾ WORKSPACES              │                                         │
-│   api-core    ●  +3 ~12   │         (active session terminal,       │
+│   demo-app    ●  +3 ~12   │         (active session terminal,       │
 │   web-app     ·  clean    │          vt100 grid render)             │
 │ ▾ REVIEW QUEUE (2)        │                                         │
 │   3 ● refactor done, 2…   ├──────── tab group B: 6 7 8 9 0 ────────┤

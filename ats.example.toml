@@ -20,7 +20,7 @@ group_b_slots = 5
 
 # calm per-template tab tinting (named colors or "#rrggbb")
 # [ui.template_colors]
-# api-core = "cyan"
+# demo-app = "cyan"
 # web-app = "#87af87"
 
 # [keys]

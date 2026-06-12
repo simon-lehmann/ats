@@ -645,12 +645,12 @@ mod tests {
     #[test]
     fn template_workspace_session_round_trip() {
         let store = Store::open_in_memory().unwrap();
-        let t = store.insert_template("api-core", "/tmp/api-core", None, None, None).unwrap();
-        let ws = store.insert_workspace(t.id, "/tmp/ws/api-core-1", WorkspaceStatus::Spawning).unwrap();
+        let t = store.insert_template("demo-app", "/tmp/demo-app", None, None, None).unwrap();
+        let ws = store.insert_workspace(t.id, "/tmp/ws/demo-app-1", WorkspaceStatus::Spawning).unwrap();
         store.update_workspace(ws, Some("agent/1"), Some("abc123"), WorkspaceStatus::Ready).unwrap();
 
         let info = store.get_workspace(ws).unwrap().unwrap();
-        assert_eq!(info.template_name, "api-core");
+        assert_eq!(info.template_name, "demo-app");
         assert_eq!(info.branch.as_deref(), Some("agent/1"));
         assert_eq!(info.status, WorkspaceStatus::Ready);
         assert_eq!(store.workspace_base_commit(ws).unwrap().as_deref(), Some("abc123"));
@@ -658,7 +658,7 @@ mod tests {
         let sid = store.insert_session(ws, Some(1), Some(4242), None).unwrap();
         let s = store.get_session(sid).unwrap().unwrap();
         assert_eq!(s.state, SessionState::Working);
-        assert_eq!(s.title, "api-core-1");
+        assert_eq!(s.title, "demo-app-1");
         assert_eq!(s.tab_slot, Some(1));
 
         store.set_session_state(sid, SessionState::Dead, None).unwrap();

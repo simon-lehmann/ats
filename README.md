@@ -61,16 +61,27 @@ the data dir with `$ATS_DATA_DIR`.
 | `Alt+q` | review queue (Enter = jump) |
 | `Alt+n` | notes: n new, e edit, f finalize, Enter send to session |
 | `Alt+p` | prompt palette: type to filter, Enter paste |
+| `Alt+d` | one-line digest of the active session |
+| `Alt+o` | orchestrator: ask a question across all sessions |
 | `Alt+Esc` | raw mode (all keys to the PTY) |
 | `Alt+x` | detach UI — agents keep running |
 | `F1` | help |
 
+## Orchestrator
+
+Set `ANTHROPIC_API_KEY` to enable digests (`Alt+d` / `ats digest <n>`),
+cross-session questions (`Alt+o` / `ats ask "which sessions are blocked?"`),
+and re-entry briefings (`ats reentry <n>` → drafted as a note). Short final
+reports are digested heuristically without an API call; `auto_digest` on
+finish is opt-in in `ats.toml` (calm by default).
+
 ## Status
 
-Phases 1–2 complete: daemon-owned PTY sessions, template→workspace clones,
+Phases 1–3 complete: daemon-owned PTY sessions, template→workspace clones,
 two-group TUI with live vt100 rendering, attach/detach with scrollback,
 transcript-based status (`!` needs input with the verbatim question, `●`
 finished with a summary line), notes (draft → finalize → send-to-session),
-prompt clipboard with fuzzy palette, git status in the rail, headless CLI.
-Next: Phase 3 orchestrator (LLM digests, cross-session questions) —
+prompt clipboard with fuzzy palette, git status in the rail, headless CLI,
+LLM orchestrator (digests, ask-across-sessions, re-entry notes).
+Remaining: Phase 4 polish (in-TUI diff viewer, kickoff presets, theming) —
 see [docs/PLAN.md §5](docs/PLAN.md).

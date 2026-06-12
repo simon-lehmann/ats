@@ -67,6 +67,8 @@ pub enum Request {
         question: String,
         session_ids: Vec<i64>,
     },
+    /// LLM-drafted catch-up note for re-entering a session
+    DraftReentry { session_id: i64 },
     ListReviewQueue,
 }
 
@@ -123,6 +125,7 @@ pub enum Response {
         patch_path: String,
     },
     Digest { session_id: i64, summary: String },
+    Answer { text: String },
 }
 
 /// Events pushed daemon → client (no correlation id).

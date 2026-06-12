@@ -40,6 +40,8 @@ pub struct OrchestratorConfig {
     pub model: String,
     /// Calm by default: digests are on-demand unless this is enabled.
     pub auto_digest: bool,
+    /// API endpoint override (tests, proxies). Default: https://api.anthropic.com
+    pub base_url: Option<String>,
 }
 
 impl Default for OrchestratorConfig {
@@ -47,6 +49,7 @@ impl Default for OrchestratorConfig {
         Self {
             model: "claude-haiku-4-5".into(),
             auto_digest: false,
+            base_url: None,
         }
     }
 }

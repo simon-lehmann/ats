@@ -131,6 +131,36 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.modal = Modal::Palette { query: String::new(), selected: 0 };
                 return Ok(());
             }
+            KeyCode::Char('o') => {
+                app.modal = Modal::Orchestrator {
+                    question: String::new(),
+                    answer: None,
+                    busy: false,
+                };
+                return Ok(());
+            }
+            // digest of the active session, in the background
+            KeyCode::Char('d') => {
+                if let Some(session_id) = app.active_session_id() {
+                    let client = app.client.clone();
+                    let tx = app.async_tx.clone();
+                    app.status_line = format!("digesting session {session_id}…");
+                    tokio::spawn(async move {
+                        let msg = match client
+                            .request(Request::SummarizeSession { session_id, force_llm: false })
+                            .await
+                        {
+                            Ok(ats_core::rpc::Response::Digest { summary, .. }) => {
+                                format!("digest [{session_id}]: {summary}")
+                            }
+                            Ok(_) => "digest: unexpected response".into(),
+                            Err(e) => format!("digest: {e:#}"),
+                        };
+                        let _ = tx.send(crate::app::AsyncMsg::Status(msg));
+                    });
+                }
+                return Ok(());
+            }
             KeyCode::Char('x') => {
                 app.should_quit = true;
                 return Ok(());
@@ -331,6 +361,31 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
             } else {
                 edit_text(&mut query, &key);
                 app.modal = Modal::Palette { query, selected: 0 };
+            }
+        }
+        Modal::Orchestrator { mut question, answer, busy } => {
+            if key.code == KeyCode::Esc {
+            } else if key.code == KeyCode::Enter && !busy && !question.trim().is_empty() {
+                let client = app.client.clone();
+                let tx = app.async_tx.clone();
+                let q = question.clone();
+                tokio::spawn(async move {
+                    let result = match client
+                        .request(Request::AskOrchestrator { question: q, session_ids: vec![] })
+                        .await
+                    {
+                        Ok(ats_core::rpc::Response::Answer { text }) => Ok(text),
+                        Ok(_) => Err("unexpected response".to_string()),
+                        Err(e) => Err(format!("{e:#}")),
+                    };
+                    let _ = tx.send(crate::app::AsyncMsg::Answer(result));
+                });
+                app.modal = Modal::Orchestrator { question, answer: None, busy: true };
+            } else if !busy {
+                edit_text(&mut question, &key);
+                app.modal = Modal::Orchestrator { question, answer, busy };
+            } else {
+                app.modal = Modal::Orchestrator { question, answer, busy };
             }
         }
         Modal::PromptEdit { mut label, mut body, editing_body } => {

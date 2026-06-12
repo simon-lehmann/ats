@@ -50,6 +50,20 @@ enum Cmd {
     Destroy { workspace_id: i64 },
     /// Sessions waiting on the developer (finished / needs input / error)
     Queue,
+    /// One-line digest of a session's final report
+    Digest {
+        session_id: i64,
+        /// force the LLM even for short reports
+        #[arg(long)]
+        llm: bool,
+    },
+    /// Ask the orchestrator a question across sessions (all by default)
+    Ask {
+        question: String,
+        session_ids: Vec<i64>,
+    },
+    /// Draft a re-entry briefing note for a session
+    Reentry { session_id: i64 },
     /// Notes / plans
     #[command(subcommand)]
     Note(NoteCmd),
@@ -235,6 +249,28 @@ async fn main() -> Result<()> {
             let resp = client.request(Request::ListReviewQueue).await?;
             if let Response::Sessions { sessions } = resp {
                 print_sessions(&sessions);
+            }
+        }
+        Cmd::Digest { session_id, llm } => {
+            let resp = client
+                .request(Request::SummarizeSession { session_id, force_llm: llm })
+                .await?;
+            if let Response::Digest { summary, .. } = resp {
+                println!("{summary}");
+            }
+        }
+        Cmd::Ask { question, session_ids } => {
+            let resp = client
+                .request(Request::AskOrchestrator { question, session_ids })
+                .await?;
+            if let Response::Answer { text } = resp {
+                println!("{text}");
+            }
+        }
+        Cmd::Reentry { session_id } => {
+            let resp = client.request(Request::DraftReentry { session_id }).await?;
+            if let Response::Note { note } = resp {
+                println!("note {} — {}\n\n{}", note.id, note.title, note.body);
             }
         }
         Cmd::Note(cmd) => match cmd {

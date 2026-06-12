@@ -162,6 +162,72 @@ fn classify_assistant(v: &Value) -> Classification {
     Classification { state: SessionState::Idle, detail: None }
 }
 
+/// Flatten the transcript tail into readable dialogue for orchestrator
+/// prompts: assistant text, the developer's messages, and tool names.
+/// Capped at `max_chars`, keeping the newest content.
+pub fn recent_dialogue(path: &Path, max_chars: usize) -> String {
+    let Some(lines) = read_tail_lines(path) else { return String::new() };
+    let mut parts: Vec<String> = Vec::new();
+    for line in &lines {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind != "assistant" && kind != "user" {
+            continue;
+        }
+        let empty = Vec::new();
+        let content = v
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
+        for block in content {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(t) = block.get("text").and_then(Value::as_str) {
+                        if !t.trim().is_empty() {
+                            parts.push(format!("{kind}: {t}"));
+                        }
+                    }
+                }
+                Some("tool_use") => {
+                    if let Some(n) = block.get("name").and_then(Value::as_str) {
+                        parts.push(format!("assistant: [runs {n}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = String::new();
+    for p in parts.iter().rev() {
+        if out.len() + p.len() + 1 > max_chars {
+            break;
+        }
+        out = format!("{p}\n{out}");
+    }
+    out
+}
+
+/// The final assistant text in the transcript, if any — digest input.
+pub fn final_text(path: &Path) -> Option<String> {
+    let lines = read_tail_lines(path)?;
+    for line in lines.iter().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let content = v.pointer("/message/content").and_then(Value::as_array)?;
+        let text: Vec<&str> = content
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect();
+        if !text.is_empty() {
+            return Some(text.join("\n"));
+        }
+    }
+    None
+}
+
 fn truncate(s: &str) -> String {
     if s.chars().count() <= DETAIL_MAX {
         return s.to_string();

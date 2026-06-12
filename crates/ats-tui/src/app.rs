@@ -35,6 +35,12 @@ pub enum Modal {
     },
     /// fuzzy prompt palette for Alt+p
     Palette { query: String, selected: usize },
+    /// orchestrator ask panel for Alt+o
+    Orchestrator {
+        question: String,
+        answer: Option<String>,
+        busy: bool,
+    },
     /// minimal prompt editor
     PromptEdit {
         label: String,
@@ -70,10 +76,24 @@ pub struct App {
     pub terms: HashMap<i64, Term>,
     pub status_line: String,
     pub should_quit: bool,
+    /// results of background API calls (digest, ask) land here; the
+    /// receiver is taken by the run loop (kept out of App so `select!`
+    /// can poll it while handlers borrow App mutably)
+    pub async_tx: tokio::sync::mpsc::UnboundedSender<AsyncMsg>,
+    pub async_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AsyncMsg>>,
+}
+
+#[derive(Debug)]
+pub enum AsyncMsg {
+    /// show in the status line
+    Status(String),
+    /// answer for the orchestrator panel
+    Answer(Result<String, String>),
 }
 
 impl App {
     pub fn new(client: Arc<Client>, a_slots: u8, b_slots: u8) -> Self {
+        let (async_tx, async_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             client,
             sessions: Vec::new(),
@@ -91,6 +111,23 @@ impl App {
             terms: HashMap::new(),
             status_line: String::new(),
             should_quit: false,
+            async_tx,
+            async_rx: Some(async_rx),
+        }
+    }
+
+    pub fn apply_async(&mut self, msg: AsyncMsg) {
+        match msg {
+            AsyncMsg::Status(s) => self.status_line = s,
+            AsyncMsg::Answer(result) => {
+                if let Modal::Orchestrator { answer, busy, .. } = &mut self.modal {
+                    *busy = false;
+                    *answer = Some(match result {
+                        Ok(a) => a,
+                        Err(e) => format!("error: {e}"),
+                    });
+                }
+            }
         }
     }
 

@@ -381,6 +381,15 @@ impl Store {
         .map_err(Into::into)
     }
 
+    pub fn insert_digest(&self, session_id: i64, summary: &str, source: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO digests (session_id, summary, source, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, summary, source, now()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_session_pid(&self, id: i64, pid: u32) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

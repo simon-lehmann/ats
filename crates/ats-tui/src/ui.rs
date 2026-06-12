@@ -22,10 +22,19 @@ pub struct PaneAreas {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
+    let vsplit = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(frame.area());
+    frame.render_widget(
+        Paragraph::new(Line::styled(format!(" {}", app.status_line), DIM)),
+        vsplit[1],
+    );
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(rail_width), Constraint::Min(20)])
-        .split(frame.area());
+        .split(vsplit[0]);
 
     draw_rail(frame, app, cols[0]);
 
@@ -46,6 +55,9 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
             draw_editor(frame, "note — Tab title/body, Ctrl+s save", title, body, *editing_body)
         }
         Modal::Palette { query, selected } => draw_palette(frame, app, query, *selected),
+        Modal::Orchestrator { question, answer, busy } => {
+            draw_orchestrator(frame, question, answer.as_deref(), *busy)
+        }
         Modal::PromptEdit { label, body, editing_body } => {
             draw_editor(frame, "prompt — Tab label/body, Ctrl+s save", label, body, *editing_body)
         }
@@ -301,6 +313,8 @@ fn draw_help(frame: &mut Frame) {
         ("Alt+q", "review queue (Enter jump, Esc close)"),
         ("Alt+n", "notes: n new, e edit, f finalize, Enter send"),
         ("Alt+p", "prompt palette (type to filter, Enter paste)"),
+        ("Alt+d", "digest the active session (one line)"),
+        ("Alt+o", "orchestrator: ask across all sessions"),
         ("Alt+Esc", "raw mode: forward all keys to the terminal"),
         ("Alt+x", "detach UI (daemon and agents keep running)"),
         ("F1 / Esc", "this help / close"),
@@ -406,6 +420,44 @@ fn draw_palette(frame: &mut Frame, app: &App, query: &str, selected: usize) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(modal_block("prompts — Enter pastes into active session")),
+        area,
+    );
+}
+
+fn draw_orchestrator(frame: &mut Frame, question: &str, answer: Option<&str>, busy: bool) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  ? ", DIM),
+            Span::styled(question.to_string(), ACTIVE),
+            Span::styled(if busy { "" } else { "▎" }, ACTIVE),
+        ]),
+        Line::styled("─".repeat(70), DIM),
+    ];
+    if busy {
+        lines.push(Line::styled("  thinking…", DIM));
+    } else if let Some(a) = answer {
+        for l in a.lines() {
+            // crude wrap at panel width
+            let mut rest = l;
+            loop {
+                let take = rest.chars().take(70).collect::<String>();
+                lines.push(Line::styled(format!("  {take}"), NORMAL));
+                if rest.chars().count() <= 70 {
+                    break;
+                }
+                rest = &rest[take.len()..];
+            }
+        }
+    } else {
+        lines.push(Line::styled(
+            "  ask across all sessions, e.g. \"which sessions are blocked?\"",
+            DIM,
+        ));
+    }
+    let area = centered(frame, 76, (lines.len() as u16 + 2).clamp(7, 28));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(modal_block("orchestrator — Enter to ask")),
         area,
     );
 }

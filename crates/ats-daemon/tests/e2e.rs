@@ -232,6 +232,150 @@ async fn quiet_session_with_question_transcript_becomes_needs_input() {
     server_handle.abort();
 }
 
+/// Minimal Anthropic-shaped HTTP server: always answers with `reply`.
+async fn fake_anthropic(listener: tokio::net::TcpListener, reply: &'static str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else { return };
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 8192];
+            // read headers + declared body length
+            let (mut header_end, mut content_len) = (None, 0usize);
+            loop {
+                let Ok(n) = sock.read(&mut tmp).await else { return };
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                        content_len = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                    }
+                }
+                if let Some(he) = header_end {
+                    if buf.len() >= he + content_len {
+                        break;
+                    }
+                }
+            }
+            let body = format!(r#"{{"content":[{{"type":"text","text":"{reply}"}}]}}"#);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_digest_ask_and_reentry() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+    let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api.local_addr().unwrap();
+    tokio::spawn(fake_anthropic(api, "CANNED ANSWER"));
+
+    let socket_str = tmp.path().join("ats-orch.sock").to_string_lossy().into_owned();
+    let template_dir = tmp.path().join("template");
+    make_template(&template_dir).await;
+
+    let mut config = Config::default();
+    config.daemon.workspaces_root =
+        tmp.path().join("workspaces").to_string_lossy().into_owned();
+    config.daemon.session_cmd = "sh -c 'echo up; sleep 30'".into();
+    config.daemon.idle_threshold_secs = 600; // keep the sweep out of the way
+    config.orchestrator.base_url = Some(format!("http://{api_addr}"));
+
+    let store = Arc::new(Store::open(&tmp.path().join("ats.db")).unwrap());
+    let daemon = Arc::new(server::Daemon::new(config, store.clone(), tmp.path().join("data")));
+    let server_handle = tokio::spawn({
+        let daemon = daemon.clone();
+        let s = socket_str.clone();
+        async move { server::serve(daemon, &s).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = Client::connect(&socket_str).await.unwrap();
+    let resp = client
+        .request(Request::RegisterTemplate {
+            name: "demo".into(),
+            path: template_dir.to_string_lossy().into_owned(),
+            setup_cmd: None,
+        })
+        .await
+        .unwrap();
+    let Response::Template { template } = resp else { panic!() };
+    let resp = client
+        .request(Request::SpawnSession {
+            template_id: template.id,
+            tab_slot: None,
+            kickoff_note_id: None,
+        })
+        .await
+        .unwrap();
+    let Response::Session { session } = resp else { panic!() };
+
+    // hand-register a transcript: short report (heuristic path) — the
+    // store is shared with the daemon, so set it directly
+    let tpath = tmp.path().join("t.jsonl");
+    std::fs::write(
+        &tpath,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Refactor done.\nAll 12 tests pass."}]}}
+"#,
+    )
+    .unwrap();
+    store
+        .set_session_transcript(session.id, &tpath.to_string_lossy())
+        .unwrap();
+
+    // heuristic digest: last line, no API call
+    let resp = client
+        .request(Request::SummarizeSession { session_id: session.id, force_llm: false })
+        .await
+        .unwrap();
+    let Response::Digest { summary, .. } = resp else { panic!("{resp:?}") };
+    assert_eq!(summary, "All 12 tests pass.");
+
+    // forced LLM digest: canned reply from the fake server
+    let resp = client
+        .request(Request::SummarizeSession { session_id: session.id, force_llm: true })
+        .await
+        .unwrap();
+    let Response::Digest { summary, .. } = resp else { panic!("{resp:?}") };
+    assert_eq!(summary, "CANNED ANSWER");
+
+    // ask across sessions
+    let resp = client
+        .request(Request::AskOrchestrator {
+            question: "which sessions are blocked?".into(),
+            session_ids: vec![session.id],
+        })
+        .await
+        .unwrap();
+    let Response::Answer { text } = resp else { panic!("{resp:?}") };
+    assert_eq!(text, "CANNED ANSWER");
+
+    // re-entry note drafted and stored
+    let resp = client
+        .request(Request::DraftReentry { session_id: session.id })
+        .await
+        .unwrap();
+    let Response::Note { note } = resp else { panic!("{resp:?}") };
+    assert!(note.title.starts_with("re-entry:"), "{}", note.title);
+    assert_eq!(note.body, "CANNED ANSWER");
+
+    let _ = client.request(Request::KillSession { session_id: session.id }).await;
+    server_handle.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_heartbeat_fires() {
     let tmp = tempfile::tempdir().unwrap();

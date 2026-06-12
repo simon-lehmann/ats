@@ -25,6 +25,7 @@ pub struct Daemon {
     pub store: Arc<Store>,
     pub sessions: SessionManager,
     pub clones: CloneManager,
+    pub orchestrator: crate::orchestrator::Orchestrator,
     pub events: broadcast::Sender<Event>,
     pub config: Config,
 }
@@ -39,7 +40,8 @@ impl Daemon {
             PathBuf::from(&config.daemon.workspaces_root),
             data_dir,
         );
-        Self { store, sessions, clones, events, config }
+        let orchestrator = crate::orchestrator::Orchestrator::new(&config.orchestrator);
+        Self { store, sessions, clones, orchestrator, events, config }
     }
 
     /// Spawn workspace + session from a template; the full `Alt+s` flow.
@@ -198,8 +200,29 @@ impl Daemon {
                     .collect();
                 Ok(Response::Sessions { sessions })
             }
-            Request::SummarizeSession { .. } | Request::AskOrchestrator { .. } => {
-                Err(anyhow!("orchestrator features land in Phase 3"))
+            Request::SummarizeSession { session_id, force_llm } => {
+                let (summary, _source) = self
+                    .orchestrator
+                    .digest(&self.store, session_id, force_llm)
+                    .await?;
+                let _ = self.events.send(Event::DigestReady {
+                    session_id,
+                    summary: summary.clone(),
+                });
+                Ok(Response::Digest { session_id, summary })
+            }
+            Request::AskOrchestrator { question, session_ids } => {
+                let ids = if session_ids.is_empty() {
+                    self.store.list_sessions()?.iter().map(|s| s.id).collect()
+                } else {
+                    session_ids
+                };
+                let text = self.orchestrator.ask(&self.store, &question, &ids).await?;
+                Ok(Response::Answer { text })
+            }
+            Request::DraftReentry { session_id } => {
+                let note = self.orchestrator.draft_reentry(&self.store, session_id).await?;
+                Ok(Response::Note { note })
             }
         }
     }
@@ -336,7 +359,27 @@ pub async fn serve(daemon: Arc<Daemon>, socket_path: &str) -> Result<()> {
                 let threshold = daemon.config.daemon.idle_threshold_secs as i64;
                 for id in daemon.sessions.quiet_working(threshold) {
                     let class = classify_session(&daemon, &claude_home, id).await;
+                    let finished = class.state == SessionState::Finished;
+                    let long_report = class
+                        .detail
+                        .as_deref()
+                        .map(|d| d.len() >= 100)
+                        .unwrap_or(false);
                     daemon.sessions.set_state(id, class.state, class.detail, &daemon.store);
+                    // opt-in auto-digest on long finished reports (plan §4.3)
+                    if finished && long_report && daemon.config.orchestrator.auto_digest {
+                        let daemon = daemon.clone();
+                        tokio::spawn(async move {
+                            match daemon.orchestrator.digest(&daemon.store, id, false).await {
+                                Ok((summary, _)) => {
+                                    let _ = daemon
+                                        .events
+                                        .send(Event::DigestReady { session_id: id, summary });
+                                }
+                                Err(e) => tracing::warn!(session = id, "auto-digest: {e:#}"),
+                            }
+                        });
+                    }
                 }
             }
         });

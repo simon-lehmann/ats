@@ -379,6 +379,160 @@ async fn orchestrator_digest_ask_and_reentry() {
     server_handle.abort();
 }
 
+/// Anthropic-shaped server that serves scripted response bodies in order
+/// (then repeats the last one).
+async fn scripted_anthropic(listener: tokio::net::TcpListener, bodies: Vec<String>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let counter = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::new(bodies);
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else { return };
+        let counter = counter.clone();
+        let bodies = bodies.clone();
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 8192];
+            let (mut header_end, mut content_len) = (None, 0usize);
+            loop {
+                let Ok(n) = sock.read(&mut tmp).await else { return };
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(pos + 4);
+                        let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                        content_len = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                    }
+                }
+                if let Some(he) = header_end {
+                    if buf.len() >= he + content_len {
+                        break;
+                    }
+                }
+            }
+            let i = counter.fetch_add(1, Ordering::SeqCst).min(bodies.len() - 1);
+            let body = &bodies[i];
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interactive_orchestrator_spawns_and_instructs_via_tools() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+    let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api.local_addr().unwrap();
+    // round 1: the model calls spawn_session; round 2: it reports back
+    tokio::spawn(scripted_anthropic(
+        api,
+        vec![
+            r#"{"stop_reason":"tool_use","content":[
+                {"type":"text","text":"Spawning a session for the parser work."},
+                {"type":"tool_use","id":"tu_1","name":"spawn_session",
+                 "input":{"template":"demo","instruction":"please build the parser"}}
+            ]}"#
+                .into(),
+            r#"{"stop_reason":"end_turn","content":[
+                {"type":"text","text":"Done: session 1 is working on the parser."}
+            ]}"#
+                .into(),
+        ],
+    ));
+
+    let socket_str = tmp.path().join("ats-agent.sock").to_string_lossy().into_owned();
+    let template_dir = tmp.path().join("template");
+    make_template(&template_dir).await;
+
+    let mut config = Config::default();
+    config.daemon.workspaces_root =
+        tmp.path().join("workspaces").to_string_lossy().into_owned();
+    config.daemon.session_cmd = "cat".into(); // echoes the instruction
+    config.daemon.idle_threshold_secs = 600;
+    config.orchestrator.base_url = Some(format!("http://{api_addr}"));
+
+    let store = Arc::new(Store::open(&tmp.path().join("ats.db")).unwrap());
+    let daemon = Arc::new(server::Daemon::new(config, store, tmp.path().join("data")));
+    let server_handle = tokio::spawn({
+        let daemon = daemon.clone();
+        let s = socket_str.clone();
+        async move { server::serve(daemon, &s).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = Client::connect(&socket_str).await.unwrap();
+    // the orchestrator needs the template to exist (it could also register
+    // it itself — covered by the tool unit path)
+    let resp = client
+        .request(Request::RegisterTemplate {
+            name: "demo".into(),
+            path: template_dir.to_string_lossy().into_owned(),
+            setup_cmd: None,
+            kickoff_prompt: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resp, Response::Template { .. }));
+
+    let mut events = client.subscribe_events();
+    let resp = client
+        .request(Request::OrchestratorChat {
+            message: "spawn a session from demo and have it build the parser".into(),
+        })
+        .await
+        .unwrap();
+    let Response::Answer { text } = resp else { panic!("{resp:?}") };
+    assert_eq!(text, "Done: session 1 is working on the parser.");
+
+    // tool-call progress was pushed
+    let mut saw_tool_progress = false;
+    while let Ok(ev) = events.try_recv() {
+        if let Event::OrchestratorProgress { text } = ev {
+            if text.contains("spawn_session") {
+                saw_tool_progress = true;
+            }
+        }
+    }
+    assert!(saw_tool_progress, "expected spawn_session progress event");
+
+    // the tool really ran: one session exists…
+    let resp = client.request(Request::ListSessions).await.unwrap();
+    let Response::Sessions { sessions } = resp else { panic!() };
+    assert_eq!(sessions.len(), 1);
+    let sid = sessions[0].id;
+
+    // …and the kickoff instruction reaches its terminal (sent ~3s in)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "instruction never arrived");
+        let resp = client.request(Request::GetScrollback { session_id: sid }).await.unwrap();
+        if let Response::Scrollback { data, .. } = resp {
+            if String::from_utf8_lossy(&data).contains("please build the parser") {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // reset clears the conversation
+    let resp = client.request(Request::OrchestratorReset).await.unwrap();
+    assert!(matches!(resp, Response::Ok));
+
+    let _ = client.request(Request::KillSession { session_id: sid }).await;
+    server_handle.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn template_kickoff_prompt_reaches_the_agent() {
     let tmp = tempfile::tempdir().unwrap();

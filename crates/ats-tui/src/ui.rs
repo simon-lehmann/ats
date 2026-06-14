@@ -304,6 +304,13 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
             tint.map(|c| Style::new().fg(c)).unwrap_or(DIM)
         };
         spans.push(Span::styled(format!(" {label} "), style));
+        // rolling actions-per-minute, dim so it never competes with the state
+        // glyph; hidden below 1 to keep idle tabs quiet
+        if let Some(apm) = session.and_then(|s| app.apm.get(&s.id)).copied() {
+            if apm >= 0.5 {
+                spans.push(Span::styled(format!("⌁{} ", apm.round() as u32), DIM));
+            }
+        }
         spans.push(Span::styled("│", DIM));
     }
     if app.raw_mode && app.focus == group {

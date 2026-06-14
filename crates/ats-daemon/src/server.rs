@@ -2,7 +2,7 @@
 //! events out. Each client tracks which sessions it has attached; `PtyOutput`
 //! is forwarded only for those (plan §3, "critical detail").
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -34,6 +34,10 @@ pub struct Daemon {
 /// Dropped into the orchestrator session's cwd so Claude Code reads it as
 /// project context: who it is and how ATS work is organized. The ATS tools
 /// themselves arrive via the user-scoped MCP server.
+/// Rolling window for the actions-per-minute gauge. 5 minutes reads "current
+/// pace" without twitching on every single tool call.
+const APM_WINDOW_SECS: i64 = 300;
+
 const ORCHESTRATOR_CLAUDE_MD: &str = r#"# ATS Orchestrator
 
 You are the **orchestrator** of ATS (Agent Terminal Suite). You coordinate a
@@ -484,26 +488,20 @@ impl Daemon {
     }
 }
 
-/// Find (and cache) the session's transcript, then classify its tail.
-async fn classify_session(
+/// Resolve a session's Claude Code transcript, discovering and caching the path
+/// on first hit. Shared by the classifier and the APM gauge.
+async fn resolve_transcript(
     daemon: &Daemon,
     claude_home: &std::path::Path,
     session_id: i64,
-) -> crate::transcript::Classification {
+) -> Option<std::path::PathBuf> {
     use crate::transcript;
-    let idle = || transcript::Classification { state: SessionState::Idle, detail: None };
-
-    let path = match daemon.store.session_transcript(session_id) {
+    match daemon.store.session_transcript(session_id) {
         Ok(Some(p)) => Some(std::path::PathBuf::from(p)),
         Ok(None) => {
-            let Ok(Some(info)) = daemon.store.get_session(session_id) else {
-                return idle();
-            };
-            let found = transcript::discover_transcript(
-                claude_home,
-                &info.workspace_path,
-                info.created_at,
-            );
+            let info = daemon.store.get_session(session_id).ok()??;
+            let found =
+                transcript::discover_transcript(claude_home, &info.workspace_path, info.created_at);
             if let Some(p) = &found {
                 let _ = daemon
                     .store
@@ -512,8 +510,18 @@ async fn classify_session(
             found
         }
         Err(_) => None,
-    };
-    match path {
+    }
+}
+
+/// Find (and cache) the session's transcript, then classify its tail.
+async fn classify_session(
+    daemon: &Daemon,
+    claude_home: &std::path::Path,
+    session_id: i64,
+) -> crate::transcript::Classification {
+    use crate::transcript;
+    let idle = || transcript::Classification { state: SessionState::Idle, detail: None };
+    match resolve_transcript(daemon, claude_home, session_id).await {
         Some(p) => tokio::task::spawn_blocking(move || transcript::classify_file(&p))
             .await
             .unwrap_or_else(|_| idle()),
@@ -621,9 +629,35 @@ pub async fn serve(daemon: Arc<Daemon>, socket_path: &str) -> Result<()> {
         tokio::spawn(async move {
             let claude_home = crate::transcript::default_claude_home();
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(period.min(2)));
+            // last rounded APM we broadcast per session — so we only push when
+            // the displayed number actually changes (calm by design).
+            let mut last_apm: HashMap<i64, i64> = HashMap::new();
             loop {
                 tick.tick().await;
                 let threshold = daemon.config.daemon.idle_threshold_secs as i64;
+
+                // rolling actions-per-minute for every live session (busy ones
+                // included — that's where pace matters). Recomputed each tick so
+                // the window self-decays toward 0 when a session goes quiet.
+                let now = crate::store::now();
+                let live: HashSet<i64> = daemon.sessions.live_session_ids().into_iter().collect();
+                for &id in &live {
+                    let Some(path) = resolve_transcript(&daemon, &claude_home, id).await else {
+                        continue;
+                    };
+                    let apm = tokio::task::spawn_blocking(move || {
+                        crate::transcript::apm_from_file(&path, APM_WINDOW_SECS, now)
+                    })
+                    .await
+                    .unwrap_or(0.0);
+                    let rounded = apm.round() as i64;
+                    if last_apm.get(&id).copied() != Some(rounded) {
+                        last_apm.insert(id, rounded);
+                        let _ = daemon.events.send(Event::SessionApm { session_id: id, apm });
+                    }
+                }
+                last_apm.retain(|id, _| live.contains(id));
+
                 for id in daemon.sessions.quiet_working(threshold) {
                     let class = classify_session(&daemon, &claude_home, id).await;
                     let finished = class.state == SessionState::Finished;

@@ -155,6 +155,10 @@ pub enum Event {
         state: SessionState,
         detail: Option<String>,
     },
+    /// Rolling actions-per-minute gauge for a live session (raw: every tool
+    /// counts equally). Pushed only when the rounded value changes, so it stays
+    /// calm. Clients drop the value when the session goes `Dead`.
+    SessionApm { session_id: i64, apm: f32 },
     DigestReady { session_id: i64, summary: String },
     WorkspaceStatusChanged {
         workspace_id: i64,

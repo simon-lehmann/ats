@@ -174,8 +174,12 @@ async fn run(
                     Ok(Event::SessionStateChanged { session_id, state, detail }) => {
                         app.set_session_state(session_id, state, detail);
                         if state == ats_core::state::SessionState::Dead {
+                            app.apm.remove(&session_id);
                             let _ = app.refresh().await;
                         }
+                    }
+                    Ok(Event::SessionApm { session_id, apm }) => {
+                        app.apm.insert(session_id, apm);
                     }
                     Ok(Event::WorkspaceStatusChanged { .. }) => {
                         let _ = app.refresh().await;

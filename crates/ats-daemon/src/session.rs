@@ -261,6 +261,13 @@ impl SessionManager {
         self.sessions.lock().unwrap().contains_key(&session_id)
     }
 
+    /// Ids of every session this daemon currently owns a PTY for — the set the
+    /// APM sweep gauges (unlike `quiet_working`, this includes busy sessions,
+    /// which are exactly the ones with an interesting pace).
+    pub fn live_session_ids(&self) -> Vec<i64> {
+        self.sessions.lock().unwrap().keys().copied().collect()
+    }
+
     /// Heartbeat (plan §4.1): live sessions still marked working whose PTY
     /// has been quiet past the threshold — candidates for classification.
     pub fn quiet_working(&self, idle_threshold_secs: i64) -> Vec<i64> {

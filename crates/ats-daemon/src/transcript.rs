@@ -207,6 +207,89 @@ pub fn recent_dialogue(path: &Path, max_chars: usize) -> String {
     out
 }
 
+/// Rolling actions-per-minute over the last `window_secs`, computed from the
+/// file tail. **Raw** APM: every tool the agent invoked counts equally — a
+/// `Read` is worth the same as an `Edit` — because we're measuring pace, not
+/// "productivity". Reads only the same 64 KB tail the classifier uses, so it's
+/// cheap; under a burst large enough to overflow the tail it errs low. `0.0`
+/// when there's no transcript yet.
+pub fn apm_from_file(path: &Path, window_secs: i64, now: i64) -> f32 {
+    let Some(lines) = read_tail_lines(path) else { return 0.0 };
+    let n = actions_in_window(lines.iter().map(String::as_str), window_secs, now);
+    n as f32 / (window_secs as f32 / 60.0)
+}
+
+/// Count `tool_use` blocks across assistant lines whose top-level `timestamp`
+/// falls in the inclusive window `[now - window_secs, now]`.
+pub fn actions_in_window<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    window_secs: i64,
+    now: i64,
+) -> u32 {
+    let floor = now - window_secs;
+    let mut count = 0u32;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(ts) = v.get("timestamp").and_then(Value::as_str).and_then(parse_iso_epoch)
+        else {
+            continue;
+        };
+        if ts < floor || ts > now {
+            continue;
+        }
+        let empty = Vec::new();
+        let content = v
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
+        count += content
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .count() as u32;
+    }
+    count
+}
+
+/// Parse a Claude Code transcript timestamp (`2026-06-14T16:06:02.123Z`, always
+/// UTC) to unix seconds. Fractional seconds and any trailing offset are ignored
+/// — Claude Code writes `Z`. Returns `None` on anything unexpected.
+fn parse_iso_epoch(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    // YYYY-MM-DD(T| )HH:MM:SS — check the fixed separators, then the fields
+    let sep_ok = b[4] == b'-'
+        && b[7] == b'-'
+        && matches!(b[10], b'T' | b't' | b' ')
+        && b[13] == b':'
+        && b[16] == b':';
+    if !sep_ok {
+        return None;
+    }
+    let num = |start: usize, len: usize| s.get(start..start + len)?.parse::<i64>().ok();
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hour, min, sec) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + min * 60 + sec)
+}
+
+/// Days since the unix epoch for a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`). Dependency-free so we don't pull in a date crate.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// The final assistant text in the transcript, if any — digest input.
 pub fn final_text(path: &Path) -> Option<String> {
     let lines = read_tail_lines(path)?;
@@ -242,6 +325,45 @@ mod tests {
 
     fn assistant_line(content: &str) -> String {
         format!(r#"{{"type":"assistant","message":{{"role":"assistant","content":[{content}]}}}}"#)
+    }
+
+    fn assistant_line_ts(ts: &str, content: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"role":"assistant","content":[{content}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn parse_iso_epoch_matches_known_instants() {
+        assert_eq!(parse_iso_epoch("1970-01-01T00:00:00Z"), Some(0));
+        // 2021-01-01T00:00:00Z = 1609459200
+        assert_eq!(parse_iso_epoch("2021-01-01T00:00:00.000Z"), Some(1_609_459_200));
+        // fractional seconds and the trailing offset are ignored
+        assert_eq!(parse_iso_epoch("2021-01-01T00:00:01.999Z"), Some(1_609_459_201));
+        assert_eq!(parse_iso_epoch("garbage"), None);
+        assert_eq!(parse_iso_epoch(""), None);
+    }
+
+    #[test]
+    fn actions_in_window_counts_tool_use_within_window_only() {
+        let now = parse_iso_epoch("2026-06-14T16:10:00Z").unwrap();
+        let window = 300; // 5 min
+        let two = r#"{"type":"tool_use","name":"Read"},{"type":"tool_use","name":"Edit"}"#;
+        let lines = [
+            assistant_line_ts("2026-06-14T16:09:30Z", two), // 30s ago → +2
+            assistant_line_ts("2026-06-14T16:06:00Z", r#"{"type":"tool_use","name":"Bash"}"#), // 4m ago → +1
+            assistant_line_ts("2026-06-14T16:00:00Z", two), // 10m ago → outside window
+            assistant_line_ts("2026-06-14T16:09:59Z", r#"{"type":"text","text":"hi"}"#), // no tool_use
+            // a user/tool_result line is never an action
+            r#"{"type":"user","timestamp":"2026-06-14T16:09:31Z","message":{"role":"user","content":[{"type":"tool_result"}]}}"#.to_string(),
+        ];
+        let n = actions_in_window(lines.iter().map(String::as_str), window, now);
+        assert_eq!(n, 3, "two recent + one mid-window tool_use, rest excluded");
+    }
+
+    #[test]
+    fn apm_from_missing_file_is_zero() {
+        assert_eq!(apm_from_file(Path::new("/nonexistent.jsonl"), 300, 1), 0.0);
     }
 
     #[test]

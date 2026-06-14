@@ -81,6 +81,9 @@ pub struct App {
     /// everything-through mode: only the toggle key is intercepted
     pub raw_mode: bool,
     pub terms: HashMap<i64, Term>,
+    /// rolling actions-per-minute per session, pushed by the daemon's
+    /// `SessionApm` event; rendered as a dim suffix in the tab label.
+    pub apm: HashMap<i64, f32>,
     pub status_line: String,
     pub should_quit: bool,
     /// results of background API calls (digest, ask) land here; the
@@ -118,6 +121,7 @@ impl App {
             template_colors: HashMap::new(),
             raw_mode: false,
             terms: HashMap::new(),
+            apm: HashMap::new(),
             status_line: String::new(),
             should_quit: false,
             async_tx,

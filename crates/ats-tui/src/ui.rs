@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{state_glyph, App, Focus, Modal};
+use crate::app::{state_glyph, App, Focus, Modal, RailAction, RailHit, TabHit};
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const NORMAL: Style = Style::new().fg(Color::Gray);
@@ -21,6 +21,9 @@ pub struct PaneAreas {
     pub b_inner: Rect,
     /// inner rect of the orchestrator overlay when it's open (for PTY sizing)
     pub orch_inner: Option<Rect>,
+    /// clickable tab labels and rail rows recorded this frame, for mouse routing
+    pub tab_hits: Vec<TabHit>,
+    pub rail_hits: Vec<RailHit>,
 }
 
 pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
@@ -35,22 +38,25 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
         .constraints([Constraint::Length(rail_width), Constraint::Min(20)])
         .split(vsplit[0]);
 
-    draw_rail(frame, app, cols[0]);
+    let rail_hits = draw_rail(frame, app, cols[0]);
 
+    let mut tab_hits: Vec<TabHit> = Vec::new();
     let (a_inner, b_inner) = if app.solo {
         // second-monitor mode: one group, full height
         let group = if app.focus == Focus::GroupB { Focus::GroupB } else { Focus::GroupA };
-        let inner = draw_group(frame, app, cols[1], group);
+        let (inner, hits) = draw_group(frame, app, cols[1], group);
+        tab_hits.extend(hits);
         (inner, inner)
     } else {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(cols[1]);
-        (
-            draw_group(frame, app, rows[0], Focus::GroupA),
-            draw_group(frame, app, rows[1], Focus::GroupB),
-        )
+        let (a_inner, a_hits) = draw_group(frame, app, rows[0], Focus::GroupA);
+        let (b_inner, b_hits) = draw_group(frame, app, rows[1], Focus::GroupB);
+        tab_hits.extend(a_hits);
+        tab_hits.extend(b_hits);
+        (a_inner, b_inner)
     };
 
     let mut orch_inner = None;
@@ -71,7 +77,7 @@ pub fn draw(frame: &mut Frame, app: &App, rail_width: u16) -> PaneAreas {
         Modal::None => {}
     }
 
-    PaneAreas { a_inner, b_inner, orch_inner }
+    PaneAreas { a_inner, b_inner, orch_inner, tab_hits, rail_hits }
 }
 
 /// Centered overlay hosting the orchestrator's live Claude Code session.
@@ -81,7 +87,7 @@ fn draw_orchestrator_overlay(frame: &mut Frame, app: &App) -> Rect {
     let w = area.width.saturating_sub(6).min(120);
     let h = area.height.saturating_sub(3);
     let view = centered(frame, w, h);
-    let block = modal_block("orchestrator — Esc to close · keys go to the agent");
+    let block = modal_block("orchestrator — Alt+o to close · keys go to the agent");
     let inner = block.inner(view);
     frame.render_widget(Clear, view);
     frame.render_widget(block, view);
@@ -171,7 +177,7 @@ fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Modal::Palette { .. } => {
             vec![("type", "filter"), ("Enter", "paste"), ("Ctrl+n", "add"), ("Esc", "close")]
         }
-        Modal::Orchestrator => vec![("Esc", "close"), ("", "keys go to the orchestrator")],
+        Modal::Orchestrator => vec![("Alt+o", "close"), ("", "keys go to the orchestrator")],
         Modal::Diff { .. } => vec![("↑↓", "scroll"), ("PgUp/Dn", "page"), ("Esc", "close")],
     }
 }
@@ -184,8 +190,14 @@ fn glyph_style(state: SessionState) -> Style {
     }
 }
 
-fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_rail(frame: &mut Frame, app: &App, area: Rect) -> Vec<RailHit> {
     let mut lines: Vec<Line> = Vec::new();
+    let mut hits: Vec<RailHit> = Vec::new();
+    // rail content sits one row below the top border; line index i → y
+    let row_y = |i: usize| area.y + 1 + i as u16;
+    let hit = |lines: &[Line], action: RailAction, hits: &mut Vec<RailHit>| {
+        hits.push(RailHit { y: row_y(lines.len().saturating_sub(1)), action });
+    };
 
     lines.push(Line::styled("▾ WORKSPACES", DIM));
     if app.workspaces.is_empty() {
@@ -227,12 +239,16 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
     let queue = app.review_queue();
     lines.push(Line::raw(""));
     lines.push(Line::styled(format!("▾ REVIEW QUEUE ({})", queue.len()), DIM));
+    hit(&lines, RailAction::Queue, &mut hits);
     for s in queue.iter().take(8) {
         let detail = s.state_detail.as_deref().unwrap_or("");
         let slot = s.tab_slot.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
         let mut text = format!("  {slot} {} {detail}", state_glyph(s.state));
         text.truncate(area.width.saturating_sub(2) as usize);
         lines.push(Line::styled(text, glyph_style(s.state)));
+        if let Some(slot) = s.tab_slot {
+            hit(&lines, RailAction::Tab(slot), &mut hits);
+        }
     }
 
     lines.push(Line::raw(""));
@@ -245,18 +261,22 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
         let mut text = format!("  {slot} {} {}", state_glyph(s.state), s.title);
         text.truncate(area.width.saturating_sub(2) as usize);
         lines.push(Line::styled(text, glyph_style(s.state)));
+        hit(&lines, RailAction::Tab(slot), &mut hits);
     }
 
     lines.push(Line::raw(""));
     lines.push(Line::styled(format!("▾ PROMPTS ({})", app.prompts.len()), DIM));
+    hit(&lines, RailAction::Palette, &mut hits);
     for p in app.prompts.iter().take(3) {
         let mut text = format!("  {}", p.label);
         text.truncate(area.width.saturating_sub(2) as usize);
         lines.push(Line::styled(text, DIM));
+        hit(&lines, RailAction::Palette, &mut hits);
     }
 
     lines.push(Line::raw(""));
     lines.push(Line::styled(format!("▾ NOTES ({})", app.notes.len()), DIM));
+    hit(&lines, RailAction::Notes, &mut hits);
     for n in app.notes.iter().take(4) {
         let marker = match n.state.as_str() {
             "finalized" => "▪",
@@ -266,6 +286,7 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
         let mut text = format!("  {marker} {}", n.title);
         text.truncate(area.width.saturating_sub(2) as usize);
         lines.push(Line::styled(text, DIM));
+        hit(&lines, RailAction::Notes, &mut hits);
     }
 
     let border_style = if app.focus == Focus::Rail { ACTIVE } else { DIM };
@@ -274,17 +295,21 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style)
         .title(Span::styled(" ats ", DIM));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    hits
 }
 
-fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
+fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> (Rect, Vec<TabHit>) {
     let (first, count, active) = if group == Focus::GroupA {
         (1u8, app.a_slots, app.active_a)
     } else {
         (app.a_slots + 1, app.b_slots, app.active_b)
     };
 
-    // tab bar: number + short name + glyph, dim; per-template tint stays calm
+    // tab bar: number + short name + glyph, dim; per-template tint stays calm.
+    // the title renders on the top border, starting one column past the corner.
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    let mut hits: Vec<TabHit> = Vec::new();
+    let mut x = area.x + 1 + 1; // +1 corner, +1 leading raw space
     for slot in first..first + count {
         let session = app.session_in_slot(slot);
         let label = match session {
@@ -303,18 +328,31 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
         } else {
             tint.map(|c| Style::new().fg(c)).unwrap_or(DIM)
         };
-        spans.push(Span::styled(format!(" {label} "), style));
+        let text = format!(" {label} ");
+        let w = text.chars().count() as u16;
+        hits.push(TabHit { rect: Rect { x, y: area.y, width: w, height: 1 }, slot });
+        x += w;
+        spans.push(Span::styled(text, style));
         // rolling actions-per-minute, dim so it never competes with the state
         // glyph; hidden below 1 to keep idle tabs quiet
         if let Some(apm) = session.and_then(|s| app.apm.get(&s.id)).copied() {
             if apm >= 0.5 {
-                spans.push(Span::styled(format!("⌁{} ", apm.round() as u32), DIM));
+                let t = format!("⌁{} ", apm.round() as u32);
+                x += t.chars().count() as u16;
+                spans.push(Span::styled(t, DIM));
             }
         }
+        x += 1;
         spans.push(Span::styled("│", DIM));
     }
     if app.raw_mode && app.focus == group {
         spans.push(Span::styled(" RAW ", ALERT));
+    }
+    // show how far back the active pane is scrolled (Alt+End / wheel-down to live)
+    if let Some(term) = app.session_in_slot(active).and_then(|s| app.terms.get(&s.id)) {
+        if term.scrollback > 0 {
+            spans.push(Span::styled(format!(" ↑{} ", term.scrollback), ALERT));
+        }
     }
 
     let border_style = if app.focus == group { NORMAL } else { DIM };
@@ -346,7 +384,7 @@ fn draw_group(frame: &mut Frame, app: &App, area: Rect, group: Focus) -> Rect {
             );
         }
     }
-    inner
+    (inner, hits)
 }
 
 /// Map a tab slot to the key that reaches it (slot 10 = key 0).
@@ -493,8 +531,10 @@ fn draw_help(frame: &mut Frame) {
         ("Alt+n", "notes: n new, e edit, f finalize, Enter send"),
         ("Alt+p", "prompt palette (type to filter, Enter paste)"),
         ("Alt+d", "digest the active session (one line)"),
-        ("Alt+o", "orchestrator chat: it sets up, spawns, instructs"),
+        ("Alt+o", "orchestrator overlay (Alt+o again to close)"),
         ("Alt+h", "harvest active workspace → diff viewer"),
+        ("Alt+PgUp/PgDn", "scroll the focused terminal (wheel works too)"),
+        ("Alt+End / Home", "scroll to live / oldest"),
         ("Alt+Esc", "raw mode: forward all keys to the terminal"),
         ("Alt+x", "detach UI (daemon and agents keep running)"),
         ("F1 / Esc", "this help / close"),

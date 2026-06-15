@@ -22,12 +22,15 @@ pub enum Request {
         tab_slot: Option<u8>,
         kickoff_note_id: Option<i64>,
     },
-    /// Bare agent session in `cwd` (default: the daemon's scratch dir) —
-    /// no workspace clone. For planning/triage alongside real workspaces.
+    /// Bare agent session in `cwd` (default: the daemon's scratch dir) — no
+    /// workspace clone. Serves planning/triage in the scratch dir and running
+    /// an agent directly in an existing repo. `cmd` overrides the configured
+    /// launch command (e.g. `claude -c`, `claude --resume`).
     SpawnScratchSession {
         cwd: Option<String>,
         tab_slot: Option<u8>,
         kickoff: Option<String>,
+        cmd: Option<String>,
     },
     AttachSession { session_id: i64 },
     DetachSession { session_id: i64 },

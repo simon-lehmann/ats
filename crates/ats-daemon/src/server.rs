@@ -63,6 +63,10 @@ in it (it asks for the path if you omit it).
   session with `send_note`.
 - **Sessions** states: working / idle / finished / needs_input / dead. Sessions
   can't see each other — instruct each with complete, self-contained prompts.
+- **Existing repos** the developer already has on disk: `spawn_in_repo {path}`
+  runs an agent there directly (no clone). Pass `cmd` to control how Claude Code
+  starts — `claude` (fresh), `claude -c` (continue the latest conversation in
+  that dir), or `claude --resume[ <id>]` (resume a specific one).
 - **Planning** that shouldn't happen inside a repo: `spawn_planning_session`.
 
 ## Conventions
@@ -196,6 +200,7 @@ impl Daemon {
         cwd: Option<String>,
         tab_slot: Option<u8>,
         kickoff: Option<String>,
+        cmd: Option<String>,
     ) -> Result<Response> {
         let cwd = match cwd {
             Some(c) => PathBuf::from(c),
@@ -231,15 +236,20 @@ impl Daemon {
             None => self.store.next_free_tab_slot(max_slots)?,
         };
         let session_id = self.store.insert_session(ws_id, slot, None, None)?;
+        let launch = cmd
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or(&self.config.daemon.session_cmd);
         let pid = self.sessions.spawn(
             session_id,
-            &self.config.daemon.session_cmd,
+            launch,
             &cwd_str,
             self.store.clone(),
         )?;
         if let Some(pid) = pid {
             let _ = self.store.set_session_pid(session_id, pid);
-            tracing::info!(session_id, pid, path = %cwd_str, "scratch session spawned");
+            tracing::info!(session_id, pid, path = %cwd_str, cmd = launch, "scratch session spawned");
         }
         if let Some(text) = kickoff {
             self.schedule_kickoff(session_id, None, text);
@@ -281,7 +291,7 @@ impl Daemon {
             .context("writing /setup-repo command")?;
 
         let resp = self
-            .spawn_scratch_session(Some(dir.to_string_lossy().into_owned()), None, kickoff)
+            .spawn_scratch_session(Some(dir.to_string_lossy().into_owned()), None, kickoff, None)
             .await?;
         if let Response::Session { session } = &resp {
             self.store.mark_orchestrator(session.id)?;
@@ -332,8 +342,8 @@ impl Daemon {
                 self.spawn_session_with_kickoff(template_id, tab_slot, kickoff_note_id, None)
                     .await
             }
-            Request::SpawnScratchSession { cwd, tab_slot, kickoff } => {
-                self.spawn_scratch_session(cwd, tab_slot, kickoff).await
+            Request::SpawnScratchSession { cwd, tab_slot, kickoff, cmd } => {
+                self.spawn_scratch_session(cwd, tab_slot, kickoff, cmd).await
             }
             Request::AttachSession { session_id } => {
                 let data = self.sessions.attach(session_id)?;

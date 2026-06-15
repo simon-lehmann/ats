@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use ratatui::layout::Rect;
 use ats_core::client::Client;
 use ats_core::rpc::{NoteInfo, PromptInfo, Request, Response, SessionInfo, TemplateInfo, WorkspaceInfo};
 use ats_core::state::SessionState;
@@ -52,12 +53,57 @@ pub enum Modal {
     },
 }
 
+/// Lines of scrollback each attached terminal retains and can scroll through.
+pub const SCROLLBACK_LINES: usize = 2000;
+
 /// One attached terminal: a client-side vt100 screen fed from scrollback +
 /// live PtyOutput events.
 pub struct Term {
     pub parser: vt100::Parser,
     pub cols: u16,
     pub rows: u16,
+    /// rows scrolled up into history; 0 = live (bottom). Mirrors the value
+    /// last handed to `parser.set_scrollback`.
+    pub scrollback: usize,
+}
+
+impl Term {
+    /// Move the view by `delta` rows (positive = back into history) and push
+    /// the new offset into the parser. Clamped to [0, SCROLLBACK_LINES].
+    pub fn scroll_by(&mut self, delta: isize) {
+        let next = (self.scrollback as isize + delta).clamp(0, SCROLLBACK_LINES as isize) as usize;
+        self.set_scroll(next);
+    }
+
+    pub fn set_scroll(&mut self, offset: usize) {
+        let offset = offset.min(SCROLLBACK_LINES);
+        self.scrollback = offset;
+        self.parser.set_scrollback(offset);
+    }
+}
+
+/// A clickable tab in a group's title bar (recorded during draw for mouse hits).
+#[derive(Clone, Copy)]
+pub struct TabHit {
+    pub rect: Rect,
+    pub slot: u8,
+}
+
+/// A clickable row in the left rail and what clicking it does.
+#[derive(Clone, Copy)]
+pub struct RailHit {
+    pub y: u16,
+    pub action: RailAction,
+}
+
+#[derive(Clone, Copy)]
+pub enum RailAction {
+    /// jump to the tab in this slot
+    Tab(u8),
+    /// open a rail tool's modal
+    Queue,
+    Notes,
+    Palette,
 }
 
 pub struct App {
@@ -84,6 +130,12 @@ pub struct App {
     /// rolling actions-per-minute per session, pushed by the daemon's
     /// `SessionApm` event; rendered as a dim suffix in the tab label.
     pub apm: HashMap<i64, f32>,
+    /// hit-test regions recorded on the last draw, for mouse routing
+    pub pane_a_rect: Rect,
+    pub pane_b_rect: Rect,
+    pub orch_rect: Rect,
+    pub tab_hits: Vec<TabHit>,
+    pub rail_hits: Vec<RailHit>,
     pub status_line: String,
     pub should_quit: bool,
     /// results of background API calls (digest, ask) land here; the
@@ -122,6 +174,11 @@ impl App {
             raw_mode: false,
             terms: HashMap::new(),
             apm: HashMap::new(),
+            pane_a_rect: Rect::default(),
+            pane_b_rect: Rect::default(),
+            orch_rect: Rect::default(),
+            tab_hits: Vec::new(),
+            rail_hits: Vec::new(),
             status_line: String::new(),
             should_quit: false,
             async_tx,
@@ -280,11 +337,11 @@ impl App {
                 .client
                 .request(Request::AttachSession { session_id: id })
                 .await?;
-            let mut parser = vt100::Parser::new(rows, cols, 2000);
+            let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
             if let Response::Scrollback { data, .. } = resp {
                 parser.process(&data);
             }
-            self.terms.insert(id, Term { parser, cols, rows });
+            self.terms.insert(id, Term { parser, cols, rows, scrollback: 0 });
             let _ = self
                 .client
                 .request(Request::ResizeSession { session_id: id, cols, rows })
@@ -296,6 +353,131 @@ impl App {
     pub fn feed_output(&mut self, session_id: i64, bytes: &[u8]) {
         if let Some(term) = self.terms.get_mut(&session_id) {
             term.parser.process(bytes);
+            // a vt100 process() resets the view to the live screen; restore the
+            // reader's scroll position so output doesn't yank them to the bottom
+            if term.scrollback != 0 {
+                term.parser.set_scrollback(term.scrollback);
+            }
+        }
+    }
+
+    /// The terminal the keyboard/scroll currently targets: the orchestrator's
+    /// session when its overlay is open, otherwise the focused group's tab.
+    fn scroll_target_id(&self) -> Option<i64> {
+        if self.modal == Modal::Orchestrator {
+            self.orchestrator_session_id()
+        } else {
+            self.active_session_id()
+        }
+    }
+
+    /// Scroll the active terminal by `delta` rows (positive = back in history).
+    pub fn scroll_active(&mut self, delta: isize) {
+        if let Some(id) = self.scroll_target_id() {
+            if let Some(term) = self.terms.get_mut(&id) {
+                term.scroll_by(delta);
+            }
+        }
+    }
+
+    /// Jump the active terminal back to the live screen.
+    pub fn scroll_active_to_live(&mut self) {
+        if let Some(id) = self.scroll_target_id() {
+            if let Some(term) = self.terms.get_mut(&id) {
+                term.set_scroll(0);
+            }
+        }
+    }
+
+    /// Jump the active terminal to the oldest retained scrollback.
+    pub fn scroll_active_to_top(&mut self) {
+        if let Some(id) = self.scroll_target_id() {
+            if let Some(term) = self.terms.get_mut(&id) {
+                term.set_scroll(SCROLLBACK_LINES);
+            }
+        }
+    }
+
+    /// Page the active terminal up/down by ~one screen.
+    pub fn scroll_active_page(&mut self, up: bool) {
+        let page = self
+            .scroll_target_id()
+            .and_then(|id| self.terms.get(&id))
+            .map(|t| t.rows.saturating_sub(1).max(1) as isize)
+            .unwrap_or(10);
+        self.scroll_active(if up { page } else { -page });
+    }
+
+    pub fn scroll_term(&mut self, id: i64, delta: isize) {
+        if let Some(term) = self.terms.get_mut(&id) {
+            term.scroll_by(delta);
+        }
+    }
+
+    /// Which terminal session sits under terminal cell (`col`, `row`), for
+    /// routing mouse-wheel scroll. Prefers the orchestrator overlay when open.
+    pub fn term_id_at(&self, col: u16, row: u16) -> Option<i64> {
+        if self.modal == Modal::Orchestrator {
+            return rect_hit(self.orch_rect, col, row)
+                .then(|| self.orchestrator_session_id())
+                .flatten();
+        }
+        if self.solo {
+            return rect_hit(self.pane_a_rect, col, row)
+                .then(|| self.session_in_slot(self.active_slot()).map(|s| s.id))
+                .flatten();
+        }
+        if rect_hit(self.pane_a_rect, col, row) {
+            if let Some(s) = self.session_in_slot(self.active_a) {
+                return Some(s.id);
+            }
+        }
+        if rect_hit(self.pane_b_rect, col, row) {
+            if let Some(s) = self.session_in_slot(self.active_b) {
+                return Some(s.id);
+            }
+        }
+        None
+    }
+
+    /// Handle a left-click at (`col`, `row`): select a clicked tab, act on a
+    /// clicked rail row, or focus the group whose pane was clicked. Returns the
+    /// modal to open (if any) so the async caller can act on it.
+    pub fn click_at(&mut self, col: u16, row: u16) -> Option<Modal> {
+        // a tab in either group's title bar
+        if let Some(hit) = self.tab_hits.iter().find(|h| rect_hit(h.rect, col, row)).copied() {
+            self.select_slot(hit.slot);
+            return None;
+        }
+        // a row in the left rail
+        if let Some(hit) = self.rail_hits.iter().find(|h| h.y == row).copied() {
+            match hit.action {
+                RailAction::Tab(slot) => self.select_slot(slot),
+                RailAction::Queue => return Some(Modal::Queue { selected: 0 }),
+                RailAction::Notes => return Some(Modal::Notes { selected: 0 }),
+                RailAction::Palette => {
+                    return Some(Modal::Palette { query: String::new(), selected: 0 })
+                }
+            }
+            return None;
+        }
+        // clicking a pane just focuses its group
+        if rect_hit(self.pane_a_rect, col, row) {
+            self.focus = Focus::GroupA;
+        } else if !self.solo && rect_hit(self.pane_b_rect, col, row) {
+            self.focus = Focus::GroupB;
+        }
+        None
+    }
+
+    /// Focus a tab slot, switching to the group that owns it (any group).
+    pub fn select_slot(&mut self, slot: u8) {
+        if slot >= 1 && slot <= self.a_slots {
+            self.active_a = slot;
+            self.focus = Focus::GroupA;
+        } else if slot > self.a_slots && slot <= self.a_slots + self.b_slots {
+            self.active_b = slot;
+            self.focus = Focus::GroupB;
         }
     }
 
@@ -316,6 +498,11 @@ pub fn newest_live_orchestrator(sessions: &[SessionInfo]) -> Option<i64> {
         .filter(|s| s.is_orchestrator && s.state != SessionState::Dead)
         .max_by_key(|s| s.id)
         .map(|s| s.id)
+}
+
+/// Is terminal cell (`col`, `row`) inside `r`?
+fn rect_hit(r: Rect, col: u16, row: u16) -> bool {
+    r.width > 0 && r.height > 0 && col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
 pub fn state_glyph(state: SessionState) -> &'static str {
@@ -352,9 +539,27 @@ pub fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fuzzy_score, newest_live_orchestrator};
+    use super::{fuzzy_score, newest_live_orchestrator, Term, SCROLLBACK_LINES};
     use ats_core::rpc::SessionInfo;
     use ats_core::state::SessionState;
+
+    #[test]
+    fn term_scroll_clamps_to_history_bounds() {
+        let mut t = Term {
+            parser: vt100::Parser::new(24, 80, SCROLLBACK_LINES),
+            cols: 80,
+            rows: 24,
+            scrollback: 0,
+        };
+        t.scroll_by(-5); // can't go below the live screen
+        assert_eq!(t.scrollback, 0);
+        t.scroll_by(10);
+        assert_eq!(t.scrollback, 10);
+        t.scroll_by(isize::MAX / 2); // can't pass the retained history
+        assert_eq!(t.scrollback, SCROLLBACK_LINES);
+        t.set_scroll(0);
+        assert_eq!(t.scrollback, 0);
+    }
 
     fn session(id: i64, is_orchestrator: bool, state: SessionState) -> SessionInfo {
         SessionInfo {

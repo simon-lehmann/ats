@@ -228,6 +228,32 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 }
                 return Ok(());
             }
+            // scroll the focused terminal's scrollback (Alt+ namespace so the
+            // keys never reach the inner agent); Alt+End returns to live
+            KeyCode::PageUp => {
+                app.scroll_active_page(true);
+                return Ok(());
+            }
+            KeyCode::PageDown => {
+                app.scroll_active_page(false);
+                return Ok(());
+            }
+            KeyCode::Up => {
+                app.scroll_active(1);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                app.scroll_active(-1);
+                return Ok(());
+            }
+            KeyCode::Home => {
+                app.scroll_active_to_top();
+                return Ok(());
+            }
+            KeyCode::End => {
+                app.scroll_active_to_live();
+                return Ok(());
+            }
             _ => {
                 // unbound Alt combo over a terminal: forward it
                 if matches!(app.focus, Focus::GroupA | Focus::GroupB) {
@@ -286,6 +312,7 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
                             cwd: None,
                             tab_slot: None,
                             kickoff: None,
+                            cmd: None,
                         })
                         .await;
                 });
@@ -457,15 +484,33 @@ async fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
         }
         // the orchestrator overlay hosts a live session: forward every key to
-        // its PTY; Esc (or Alt+o again) closes the overlay, leaving it running
+        // its PTY (Esc included, so you can interrupt the agent). Alt+o toggles
+        // the overlay shut, leaving the session running.
         Modal::Orchestrator => {
             let alt = key.modifiers.contains(KeyModifiers::ALT);
-            if key.code == KeyCode::Esc || (alt && key.code == KeyCode::Char('o')) {
+            if alt && key.code == KeyCode::Char('o') {
                 // closed: sync_attachments will detach it on the next frame
+            } else if alt && matches!(
+                key.code,
+                KeyCode::PageUp | KeyCode::PageDown | KeyCode::Up | KeyCode::Down
+                    | KeyCode::Home | KeyCode::End
+            ) {
+                // scroll the overlay's scrollback (scroll_active targets it)
+                match key.code {
+                    KeyCode::PageUp => app.scroll_active_page(true),
+                    KeyCode::PageDown => app.scroll_active_page(false),
+                    KeyCode::Up => app.scroll_active(1),
+                    KeyCode::Down => app.scroll_active(-1),
+                    KeyCode::Home => app.scroll_active_to_top(),
+                    _ => app.scroll_active_to_live(),
+                }
+                app.modal = Modal::Orchestrator;
             } else {
                 if let Some(id) = app.orchestrator_session_id() {
                     let bytes = key_to_bytes(&key);
                     if !bytes.is_empty() {
+                        // any key sent to the agent snaps the view back to live
+                        app.scroll_active_to_live();
                         app.client
                             .request(Request::WriteStdin { session_id: id, bytes })
                             .await?;
@@ -583,6 +628,8 @@ async fn forward(app: &mut App, key: &KeyEvent) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
+    // typing into a session snaps its view back to the live screen
+    app.scroll_active_to_live();
     app.client
         .request(Request::WriteStdin { session_id, bytes })
         .await?;

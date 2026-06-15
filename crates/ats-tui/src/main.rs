@@ -9,7 +9,8 @@ use ats_core::client::Client;
 use ats_core::config::Config;
 use ats_core::rpc::{Event, Request, Response};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event as CtEvent, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CtEvent, EventStream, KeyEventKind, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use futures::StreamExt;
@@ -74,9 +75,10 @@ async fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     // bracketed paste: the outer terminal frames pastes/drag-drops, and we
     // re-frame them into the session PTY so the agent treats them literally
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // mouse capture lets the wheel scroll panes and clicks select tabs/rail rows
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     let result = run(&mut terminal, client, &config).await;
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -139,6 +141,12 @@ async fn run(
                 (Some(r), Some(id)) => Some((id, (r.width, r.height))),
                 _ => None,
             };
+            // remember hit-test regions for mouse routing
+            app.pane_a_rect = areas.a_inner;
+            app.pane_b_rect = areas.b_inner;
+            app.orch_rect = areas.orch_inner.unwrap_or_default();
+            app.tab_hits = areas.tab_hits;
+            app.rail_hits = areas.rail_hits;
             if let Err(e) = app.sync_attachments(pane_a, pane_b, orch).await {
                 app.status_line = format!("attach: {e:#}");
             }
@@ -155,6 +163,32 @@ async fn run(
                     }
                     Some(Ok(CtEvent::Paste(text))) => {
                         input::handle_paste(&mut app, text).await?;
+                    }
+                    Some(Ok(CtEvent::Mouse(m))) => {
+                        match m.kind {
+                            // wheel scrolls the scrollback of the pane under the
+                            // cursor; a notch moves three lines like a real terminal
+                            MouseEventKind::ScrollUp => {
+                                if let Some(id) = app.term_id_at(m.column, m.row) {
+                                    app.scroll_term(id, 3);
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if let Some(id) = app.term_id_at(m.column, m.row) {
+                                    app.scroll_term(id, -3);
+                                }
+                            }
+                            // left-click selects a tab / acts on a rail row (only
+                            // when no modal is capturing input)
+                            MouseEventKind::Down(MouseButton::Left)
+                                if app.modal == app::Modal::None && !app.raw_mode =>
+                            {
+                                if let Some(modal) = app.click_at(m.column, m.row) {
+                                    app.modal = modal;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     Some(Ok(CtEvent::Resize(_, _))) => { /* redraw on next loop */ }
                     Some(Ok(_)) => {}
@@ -246,9 +280,10 @@ mod tests {
         let mut app = App::new(client, 5, 5);
         app.refresh().await.unwrap();
 
+        let mut captured = None;
         terminal
             .draw(|frame| {
-                ui::draw(frame, &app, 28);
+                captured = Some(ui::draw(frame, &app, 28));
             })
             .unwrap();
 
@@ -256,6 +291,15 @@ mod tests {
         assert!(text.contains("WORKSPACES"));
         assert!(text.contains("REVIEW QUEUE"));
         assert!(text.contains("empty slot"));
+
+        // mouse hit-regions: one clickable tab per slot in both groups, and the
+        // rail exposes its tool sections (REVIEW QUEUE / PROMPTS / NOTES)
+        let areas = captured.unwrap();
+        assert_eq!(areas.tab_hits.len() as u8, app.a_slots + app.b_slots);
+        assert!(matches!(
+            areas.rail_hits.iter().map(|h| h.action).next(),
+            Some(crate::app::RailAction::Queue)
+        ));
         handle.abort();
     }
 }

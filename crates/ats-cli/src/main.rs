@@ -39,7 +39,8 @@ enum Cmd {
         #[arg(long)]
         slot: Option<u8>,
     },
-    /// Bare planning/triage session — no workspace clone
+    /// Bare agent session — no workspace clone. With --cwd, runs in an existing
+    /// repo; with --cmd, override the launch command (e.g. `claude -c`).
     Scratch {
         /// working directory (default: the daemon's scratch dir)
         #[arg(long)]
@@ -47,6 +48,9 @@ enum Cmd {
         /// kickoff instruction typed at the agent once booted
         #[arg(long)]
         kickoff: Option<String>,
+        /// launch command override, e.g. "claude -c" or "claude --resume"
+        #[arg(long)]
+        cmd: Option<String>,
     },
     /// Send text to a session's stdin (a trailing Enter is added)
     Send { session_id: i64, text: String },
@@ -305,13 +309,13 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Scratch { cwd, kickoff } => {
+        Cmd::Scratch { cwd, kickoff, cmd } => {
             let resp = client
-                .request(Request::SpawnScratchSession { cwd, tab_slot: None, kickoff })
+                .request(Request::SpawnScratchSession { cwd, tab_slot: None, kickoff, cmd })
                 .await?;
             if let Response::Session { session } = resp {
                 println!(
-                    "planning session {} in {} (tab {})",
+                    "session {} in {} (tab {})",
                     session.id,
                     session.workspace_path,
                     session.tab_slot.map(|n| n.to_string()).unwrap_or_else(|| "-".into())

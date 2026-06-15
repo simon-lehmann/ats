@@ -481,6 +481,7 @@ async fn scratch_session_runs_without_workspace_clone() {
             cwd: None,
             tab_slot: None,
             kickoff: Some("draft a plan for the migration".into()),
+            cmd: None,
         })
         .await
         .unwrap();
@@ -518,6 +519,7 @@ async fn scratch_session_runs_without_workspace_clone() {
             cwd: Some(other.to_string_lossy().into_owned()),
             tab_slot: None,
             kickoff: None,
+            cmd: None,
         })
         .await
         .unwrap();
@@ -742,7 +744,7 @@ async fn agent_exit_drops_to_a_live_shell() {
     let client = connect_retry(&socket_str).await;
 
     let Response::Session { session } = client
-        .request(Request::SpawnScratchSession { cwd: None, tab_slot: None, kickoff: None })
+        .request(Request::SpawnScratchSession { cwd: None, tab_slot: None, kickoff: None, cmd: None })
         .await
         .unwrap()
     else {

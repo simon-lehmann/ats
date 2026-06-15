@@ -54,6 +54,15 @@ pub(crate) fn tools() -> Value {
             }}
         },
         {
+            "name": "spawn_in_repo",
+            "description": "Start an agent session directly in an EXISTING directory on disk (a repo the developer already has) — no clone, the agent works in that directory as-is. Use this whenever the developer wants a Claude Code session in one of their own repos. By default runs the configured command (`claude`); set `cmd` to run any command you'd type yourself, e.g. 'claude -c' (continue the latest conversation in that dir), 'claude --resume' (interactive picker), or 'claude --resume <id>'. Takes a normal tab slot. The directory is never deleted by harvest/destroy.",
+            "input_schema": {"type": "object", "properties": {
+                "path": {"type": "string", "description": "absolute path to an existing directory/repo to run the agent in"},
+                "cmd": {"type": "string", "description": "launch command override; default 'claude'. e.g. 'claude -c', 'claude --resume', 'claude --resume <id>'"},
+                "instruction": {"type": "string", "description": "optional kickoff typed at the agent once booted"}
+            }, "required": ["path"]}
+        },
+        {
             "name": "send_to_session",
             "description": "Type a message into a session's terminal (an Enter keypress is appended). Use for instructing the agent or answering its question.",
             "input_schema": {"type": "object", "properties": {
@@ -299,11 +308,30 @@ pub(crate) async fn execute_tool(daemon: &Arc<Daemon>, name: &str, input: &Value
                     input.get("cwd").and_then(Value::as_str).map(str::to_owned),
                     None,
                     input.get("instruction").and_then(Value::as_str).map(str::to_owned),
+                    None,
                 )
                 .await?;
             if let ats_core::rpc::Response::Session { session } = resp {
                 Ok(format!(
                     "planning session id={} slot={:?} cwd={}",
+                    session.id, session.tab_slot, session.workspace_path
+                ))
+            } else {
+                Ok("spawned".into())
+            }
+        }
+        "spawn_in_repo" => {
+            let resp = daemon
+                .spawn_scratch_session(
+                    Some(text("path")?),
+                    None,
+                    input.get("instruction").and_then(Value::as_str).map(str::to_owned),
+                    input.get("cmd").and_then(Value::as_str).map(str::to_owned),
+                )
+                .await?;
+            if let ats_core::rpc::Response::Session { session } = resp {
+                Ok(format!(
+                    "session id={} slot={:?} cwd={}",
                     session.id, session.tab_slot, session.workspace_path
                 ))
             } else {
@@ -575,7 +603,7 @@ mod tests {
             .collect();
         const HANDLED: &[&str] = &[
             "list_templates", "register_template", "list_sessions", "spawn_session",
-            "spawn_planning_session",
+            "spawn_planning_session", "spawn_in_repo",
             "send_to_session", "broadcast", "read_session", "harvest", "kill_session",
             "list_notes", "add_note", "finalize_note", "send_note",
             "list_prompts", "save_prompt", "digest_session",
